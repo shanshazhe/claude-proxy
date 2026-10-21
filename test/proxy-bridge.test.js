@@ -128,6 +128,7 @@ for (const platform of ["mac", "windows"]) {
     const body = { model: "gpt-5", messages: [], stream: false };
     const collected = await context.bridge.requestResponses(body, { onCacheUsage() {} });
     const anthropic = context.bridge.convertOpenAIToAnthropic(collected, "gpt-5");
+    assert.equal(anthropic.model, "anthropic/gpt-5");
     assert.equal(anthropic.content[0].type, "thinking");
     assert.equal(anthropic.content[0].thinking, "Public reasoning summary");
     assert.equal(anthropic.usage.input_tokens, 464);
@@ -166,7 +167,7 @@ for (const platform of ["mac", "windows"]) {
     assert.ok(models.every((entry) => /^(?:claude-|anthropic\/gpt-)/.test(entry.id)));
     assert.ok(models.some((entry) => entry.display_name === "gpt-5.4"));
 
-    for (const model of ["claude-sonnet-5.5", "claude-sonnet-5.5[1m]", "claude-gateway/claude-sonnet-5.5"]) {
+    for (const model of ["claude-sonnet-5.5", "claude-sonnet-5.5[1m]", "anthropic/claude-sonnet-5.5"]) {
       const request = new EventEmitter();
       request.method = "POST";
       request.url = "/v1/messages?beta=true";
@@ -288,7 +289,7 @@ for (const platform of ["mac", "windows"]) {
       setTimeout, clearTimeout, setInterval, clearInterval
     };
     const source = fs.readFileSync(filename, "utf8").split("\nsyncClaudeSettings();")[0];
-    vm.runInNewContext(source, context, { filename });
+    vm.runInNewContext(source + '\ngetConfiguredModel = () => "gpt-6.1-sol";', context, { filename });
     const send = async (payload, url = "/v1/messages?beta=true") => {
       const request = new EventEmitter();
       Object.assign(request, { method: "POST", url, headers: {} });
@@ -317,6 +318,15 @@ for (const platform of ["mac", "windows"]) {
     const collected = JSON.parse((await send(payload(false))).body);
     assert.deepEqual([collected.content[0].text, collected.stop_reason, collected.role], ["Done. 完成", "end_turn", "assistant"]);
     assert.equal(JSON.stringify(enqueued), JSON.stringify([{ root: "/repo", changed_paths: ["a.js"] }]));
+    assert.equal(forwarded.length, 0);
+    for (const model of ["gpt-6.1-sol", "anthropic/gpt-6.1-sol[1m]", "sonnet"]) {
+      for (const stream of [false, true]) {
+        const reply = await send({ ...payload(stream), model });
+        const start = stream && reply.body.split("\n\n").find((frame) => frame.startsWith("event: message_start\n"));
+        const actual = stream ? JSON.parse(start.split("\ndata: ")[1]).message : JSON.parse(reply.body);
+        assert.equal(actual.model, "anthropic/gpt-6.1-sol");
+      }
+    }
     assert.equal(forwarded.length, 0);
 
     await send(payload(true, [result, { type: "text", text: "and one more thing" }]));
@@ -409,6 +419,7 @@ for (const platform of ["mac", "windows"]) {
     const events = streamed.body.split("\n\n").filter((frame) => frame.startsWith("event:")).map((frame) => JSON.parse(frame.split("\ndata: ")[1]));
     assert.deepEqual(events.map((event) => event.type), ["message_start", "content_block_start", "content_block_delta", "content_block_stop",
       "content_block_start", "content_block_stop", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]);
+    assert.equal(events[0].message.model, "claude-opus-5.5");
     assert.deepEqual(events[4].content_block, content[1]);
     assert.equal(events[9].delta.stop_reason, "end_turn");
     assert.equal(searches[0].copilot, true);
@@ -419,17 +430,23 @@ for (const platform of ["mac", "windows"]) {
     const collected = JSON.parse((await send(payload("anthropic/gpt-6.1-sol[1m]", false))).body);
     assert.deepEqual(collected.content, content);
     assert.equal(collected.stop_reason, "end_turn");
+    assert.equal(collected.model, "anthropic/gpt-6.1-sol");
     assert.deepEqual([searches[1].copilot, searches[1].body.model], [false, "gpt-6.1-sol"]);
+
+    const gptStream = await send(payload("gpt-6.1-sol", true));
+    const start = gptStream.body.split("\n\n").find((frame) => frame.startsWith("event: message_start\n"));
+    assert.equal(JSON.parse(start.split("\ndata: ")[1]).message.model, "anthropic/gpt-6.1-sol");
+    assert.equal(searches[2].body.model, "gpt-6.1-sol");
 
     const rejected = await send(payload("gpt-6.1-sol", true, { blocked_domains: ["example.com"] }));
     assert.equal(rejected.response.status, 400);
     assert.match(JSON.parse(rejected.body).error.message, /blocked_domains/);
-    assert.equal(searches.length, 2);
+    assert.equal(searches.length, 3);
 
     // Token counting keeps its native route and never runs a real search.
     await send(payload("claude-opus-5.5", false), "/v1/messages/count_tokens");
     assert.equal(forwarded.length, 1);
-    assert.equal(searches.length, 2);
+    assert.equal(searches.length, 3);
 
     hang = true;
     await send(payload("gpt-6.1-sol", true), "/v1/messages?beta=true", { close: true });

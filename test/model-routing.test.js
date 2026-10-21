@@ -1,19 +1,27 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { selectModel, toGatewayModels } = require("../lib/model-routing");
+const { selectModel, toGatewayModelId, toGatewayModels } = require("../lib/model-routing");
 
 test("CLI explicit model and discovery aliases override settings", () => {
   const fallback = "gpt-5.4";
   for (const model of ["gpt-5.4", "openai/gpt-5", "claude-sonnet-4"]) {
     assert.equal(selectModel(model, fallback), model);
     assert.equal(selectModel("anthropic/" + model, fallback), model);
-    // Spelling saved before the anthropic/ rename still routes.
-    assert.equal(selectModel("claude-gateway/" + model, fallback), model);
+    assert.equal(selectModel("claude-gateway/" + model, fallback), "claude-gateway/" + model);
   }
   assert.equal(selectModel("anthropic/" + fallback, "gpt-5"), fallback);
   assert.equal(selectModel("claude-sonnet-5.5", fallback), "claude-sonnet-5.5");
-  assert.equal(selectModel("claude-gateway/claude-opus-5.5", fallback), "claude-opus-5.5");
+  assert.equal(selectModel("claude-gateway/claude-opus-5.5", fallback), "claude-gateway/claude-opus-5.5");
   for (const alias of [undefined, "", "sonnet", "opus", "haiku"]) assert.equal(selectModel(alias, fallback), fallback);
+});
+
+test("gateway identity is stable across raw and prefixed GPT IDs without changing Claude IDs", () => {
+  for (const id of ["gpt-6.1-sol", "openai/gpt-test"]) {
+    assert.equal(toGatewayModelId(id), "anthropic/" + id);
+    assert.equal(toGatewayModelId("anthropic/" + id), "anthropic/" + id);
+    assert.equal(selectModel(toGatewayModelId(id), "unused"), id);
+  }
+  for (const id of ["claude-sonnet-5.5", "claude-haiku-5.5[1m]"]) assert.equal(toGatewayModelId(id), id);
 });
 
 test("unknown capacity is not upgraded to 1M from a model-family name", () => {

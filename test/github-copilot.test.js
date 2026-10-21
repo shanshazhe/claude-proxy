@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { PassThrough } = require("stream");
-const { forwardClaudeRequest, getCopilotHeaders, discoverCopilotModels, listCopilotResponsesModels, loadCopilotResponsesAuth } = require("../lib/github-copilot");
+const { isClaudeModel, forwardClaudeRequest, getCopilotHeaders, discoverCopilotModels, listCopilotResponsesModels, loadCopilotResponsesAuth } = require("../lib/github-copilot");
 const { prepareClaudeCache } = require("../lib/anthropic-cache");
 const { createProjectMemoryGateway, TOOL_NAME } = require("../lib/project-memory-gateway");
 
@@ -15,6 +15,12 @@ function clientResponse() {
   response.text = () => Buffer.concat(chunks).toString("utf8");
   return response;
 }
+
+test("Claude routing recognizes model IDs, not removed gateway paths", () => {
+  for (const model of ["claude-sonnet-5.5", "claude-sonnet-5.5[1m]"]) assert.equal(isClaudeModel(model), true);
+  for (const model of ["gpt-test", "anthropic/claude-sonnet-5.5", "claude-gateway/gpt-test", "claude-gateway/claude-sonnet-5.5"])
+    assert.equal(isClaudeModel(model), false);
+});
 
 test("Copilot forwards native Anthropic SSE, tools, signatures and cache usage", async () => {
   const body = {

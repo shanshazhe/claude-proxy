@@ -4,7 +4,7 @@ const fs = require("fs");
 const path = require("path");
 
 const { isResponsesModel, getPromptCacheKey, getResponsesReasoning, requestResponses } = require("../lib/openai-responses");
-const { selectModel, toGatewayModels } = require("../lib/model-routing");
+const { selectModel, toGatewayModelId, toGatewayModels } = require("../lib/model-routing");
 const { createModelDiscovery } = require("../lib/model-discovery");
 const { isClaudeModel, forwardClaudeRequest } = require("../lib/github-copilot");
 const { parseWebSearchRequest, runWebSearch, toAnthropicMessage, toAnthropicEvents } = require("../lib/web-search");
@@ -399,7 +399,7 @@ function convertOpenAIToAnthropic(openaiResp, model) {
     id: openaiResp.id || "msg_" + Date.now(),
     type: "message",
     role: "assistant",
-    model: model,
+    model: toGatewayModelId(model),
     content: content,
     stop_reason: stopReason,
     stop_sequence: null,
@@ -508,17 +508,18 @@ async function writeSseEvent(res, eventName, data) {
 
 // 项目记忆调用的后续请求由代理直接结束这一轮；用量按请求体字节估算，避免客户端的上下文统计归零。
 async function sendLocalMessage(res, body, text, requestBytes, requestId) {
+  const model = selectModel(body.model, getConfiguredModel(body.model))?.replace(/\[1m\]$/i, "");
   const usage = {
     input_tokens: Math.ceil(requestBytes / ESTIMATED_BYTES_PER_TOKEN),
     output_tokens: Math.ceil(Buffer.byteLength(text) / ESTIMATED_BYTES_PER_TOKEN)
   };
   if (!body.stream) {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ id: "msg_" + Date.now(), type: "message", role: "assistant", model: body.model,
+    res.end(JSON.stringify({ id: "msg_" + Date.now(), type: "message", role: "assistant", model: toGatewayModelId(model),
       content: [{ type: "text", text }], stop_reason: "end_turn", stop_sequence: null, usage }));
     return;
   }
-  if (!(await openAnthropicStream(res, body.model, requestId))) return;
+  if (!(await openAnthropicStream(res, model, requestId))) return;
   await writeSseEvent(res, "content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
   await writeSseEvent(res, "content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
   await writeSseEvent(res, "content_block_stop", { type: "content_block_stop", index: 0 });
@@ -567,7 +568,7 @@ async function openAnthropicStream(clientRes, model, requestId) {
       id: "msg_" + Date.now(),
       type: "message",
       role: "assistant",
-      model: model,
+      model: toGatewayModelId(model),
       content: [],
       stop_reason: null,
       stop_sequence: null,
@@ -935,7 +936,7 @@ async function answerWebSearch(anthropicBody, search, model, requestId, res) {
       onCacheUsage: (usage) => logEvent(requestId, "OpenAI prompt cache usage", usage) });
     stopKeepAlive();
     logEvent(requestId, "Web search completed", { model: result.model, auth_kind: result.authKind, searches: result.searches, results: result.hits, capped: result.capped });
-    const message = toAnthropicMessage(result, model);
+    const message = toAnthropicMessage(result, toGatewayModelId(model));
     if (!anthropicBody.stream) {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(message));
@@ -1097,7 +1098,7 @@ const server = http.createServer(async (req, res) => {
           const assembled = await requestResponses(openaiBody, {
             onCacheUsage: (usage) => logEvent(requestId, "OpenAI prompt cache usage", usage)
           });
-          const anthropicResp = convertOpenAIToAnthropic(assembled, assembled.model || model);
+          const anthropicResp = convertOpenAIToAnthropic(assembled, model);
           anthropicResp.id = assembled.id || anthropicResp.id;
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(responseHandler ? responseHandler.message(anthropicResp) : anthropicResp));

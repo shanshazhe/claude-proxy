@@ -83,10 +83,10 @@ for (const provider of ["openai", "openai-codex", "environment"]) {
 }
 
 for (const [settings, expected] of [
-  [{ env: { CLAUDE_CODE_SUBAGENT_MODEL: "claude-gateway/gpt-second", ANTHROPIC_MODEL: "gpt-first" } }, "gpt-second"],
+  [{ env: { CLAUDE_CODE_SUBAGENT_MODEL: "anthropic/gpt-second", ANTHROPIC_MODEL: "gpt-first" } }, "gpt-second"],
   [{ env: { CLAUDE_CODE_SUBAGENT_MODEL: "anthropic/gpt-removed", ANTHROPIC_MODEL: "anthropic/gpt-second" } }, "gpt-second"],
   [{ env: { ANTHROPIC_MODEL: "gpt-second" }, model: "gpt-first" }, "gpt-second"],
-  [{ env: { ANTHROPIC_MODEL: "claude-opus-5-5" }, model: "claude-gateway/gpt-second" }, "gpt-second"],
+  [{ env: { ANTHROPIC_MODEL: "claude-opus-5-5" }, model: "anthropic/gpt-second" }, "gpt-second"],
   [{ env: { ANTHROPIC_MODEL: "claude-opus-5-5", CLAUDE_CODE_SUBAGENT_MODEL: "haiku" } }, "gpt-first"],
   [{ model: "gpt-removed" }, "gpt-first"],
   [{}, "gpt-first"]
@@ -109,7 +109,7 @@ test("GPT startup sync canonicalizes catalog prefixes and removes stale GPT cont
   const f = fixture(t);
   f.write({ env: { CLAUDE_CODE_SUBAGENT_MODEL: "gpt-second[1m]" } });
   const setup = createClaudeSetup({ ...f.base, getAvailableModels: async () => ({ data: [
-    { id: "anthropic/gpt-first" }, { id: "claude-gateway/gpt-second[1m]", context_window: 1000000 }
+    { id: "anthropic/gpt-first" }, { id: "anthropic/gpt-second[1m]", context_window: 1000000 }
   ] }) });
   assert.equal((await setup.syncGptSubagentModel()).model, "anthropic/gpt-second");
   assert.equal(f.read().env.CLAUDE_CODE_SUBAGENT_MODEL, "anthropic/gpt-second");
@@ -355,7 +355,7 @@ for (const provider of ["openai-codex", "github-copilot", "environment"]) {
     const expected = provider === "github-copilot" ? "claude-opus-5-5" : "gpt-test";
     const setup = createClaudeSetup({ ...f.base, env: provider === "environment" ? { OPENAI_API_KEY: "env-only-secret" } : {},
       getAvailableModels: async () => ({ data: [{ id: "unsupported-model" }, { id: "gpt-test" }, { id: "claude-opus-5-5" }] }) });
-    f.write({ env: { ANTHROPIC_MODEL: "claude-gateway/vendor/stale" } });
+    f.write({ env: { ANTHROPIC_MODEL: "anthropic/vendor/stale" } });
     const result = await setup.configureCli();
     assert.equal(result.model.replace(/\[1m\]$/, ""), provider === "github-copilot" ? expected : `anthropic/${expected}`);
     assert.ok(!JSON.stringify(f.read()).includes("env-only-secret"));
@@ -366,7 +366,7 @@ for (const provider of ["openai-codex", "github-copilot", "environment"]) {
 
 test("preserves the latest available model choice including extended context gateway spelling", async (t) => {
   const f = fixture(t);
-  f.write({ env: { ANTHROPIC_MODEL: "claude-gateway/gpt-second" } });
+  f.write({ env: { ANTHROPIC_MODEL: "anthropic/gpt-second" } });
   const setup = createClaudeSetup({ ...f.base, getAvailableModels: async () => ({ data: [{ id: "gpt-first" }, { id: "gpt-second" }] }) });
   assert.equal((await setup.configureCli()).model, "anthropic/gpt-second");
 });

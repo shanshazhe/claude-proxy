@@ -7,6 +7,7 @@ const http = require("http");
 const vm = require("vm");
 const { createRequire } = require("module");
 const { createCredentialStore } = require("../lib/credential-store");
+const { buildLaunch } = require("../lib/claude-launch");
 
 for (const platform of ["mac", "windows"]) {
   test(`${platform} isolated HTTP gateway covers both providers, protected setup and read-only startup`, async (t) => {
@@ -137,17 +138,36 @@ for (const platform of ["mac", "windows"]) {
         assert.equal(result.status, 200);
         const text = await result.text();
         assert.match(text, /cache_read_input_tokens["\s:]+64/);
-        if (stream) assert.match(text, /message_stop/);
-        else assert.equal(JSON.parse(text).type, "message");
+        if (stream) {
+          assert.match(text, /message_stop/);
+          const start = text.split("\n\n").find((frame) => frame.startsWith("event: message_start\n"));
+          assert.equal(JSON.parse(start.split("\ndata: ")[1]).message.model, model);
+        } else {
+          assert.equal(JSON.parse(text).type, "message");
+          assert.equal(JSON.parse(text).model, model);
+        }
       }
     }
     assert.equal(upstream.length, 4);
+    assert.deepEqual(upstream.map((request) => request.payload.model), ["gpt-test", "gpt-test", "claude-sonnet-test", "claude-sonnet-test"]);
     assert.equal(upstream[0].payload.input[1].content[1].type, "input_image");
     assert.equal(upstream[0].payload.tools[0].type, "function");
     assert.equal(upstream[2].payload.messages[0].content[1].type, "image");
     for (const request of upstream) assert.equal(request.payload.tools.at(-1).name, "ProjectMemoryUpdate");
     assert.match(upstream[0].payload.input[0].content[0].text, /ProjectMemoryUpdate/);
     assert.match(upstream[2].payload.system.at(-1).text, /ProjectMemoryUpdate/);
+    for (const stream of [false, true]) {
+      const launched = buildLaunch(models, ["--model", "gpt-test"], {});
+      assert.deepEqual(launched.args, ["--model", "anthropic/gpt-test"]);
+      const result = await fetch(base + "/v1/messages", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "gpt-test", stream, messages: [{ role: "user", content: "hello" }] }) });
+      assert.equal(result.status, 200);
+      const text = await result.text();
+      const start = stream && text.split("\n\n").find((frame) => frame.startsWith("event: message_start\n"));
+      const message = stream ? JSON.parse(start.split("\ndata: ")[1]).message : JSON.parse(text);
+      assert.equal(message.model, launched.args[1]);
+      assert.equal(upstream.at(-1).payload.model, "gpt-test");
+    }
     const disabledMemory = await fetch(base + "/api/auth/project-memory/configure", { method: "POST", headers, body: JSON.stringify({ enabled: false }) });
     assert.equal(disabledMemory.status, 200);
     const disabledResult = await disabledMemory.json();
@@ -155,7 +175,7 @@ for (const platform of ["mac", "windows"]) {
     assert.equal(disabledResult.replaced, false);
     assert.deepEqual(memoryCalls, ["factory", true, false]);
     const count = upstream.length;
-    for (const model of ["unknown-model", "anthropic/unsupported", "gpt-oss-20b"]) {
+    for (const model of ["unknown-model", "anthropic/unsupported", "gpt-oss-20b", "claude-gateway/gpt-test", "claude-gateway/claude-sonnet-test"]) {
       const result = await fetch(base + "/v1/messages", { method: "POST", body: JSON.stringify({ model, messages: [] }) });
       assert.equal(result.status, 400);
     }

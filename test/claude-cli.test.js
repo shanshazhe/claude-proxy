@@ -306,8 +306,8 @@ test("launcher applies a fixed GPT window across GPT/Claude switching; compactio
   };
   try {
     const switched = await run(true);
-    assert.deepEqual(switched[0].windows, { "gpt-6.1-sol": 872000 });
-    assert.deepEqual(switched[1].windows, { "gpt-6.1-sol": 872000, "claude-opus-5.5[1m]": 1000000 });
+    assert.deepEqual(switched[0].windows, { "anthropic/gpt-6.1-sol": 872000 });
+    assert.deepEqual(switched[1].windows, { "anthropic/gpt-6.1-sol": 872000, "claude-opus-5.5[1m]": 1000000 });
     assert.deepEqual(switched[1].requests.map((row) => row.summary), [false], "900K fits Opus's declared 1M window");
     assert.ok(switched[2].requests.some((row) => row.summary), "900K exceeds GPT's 872K window: " + JSON.stringify(switched[2].requests));
     assert.deepEqual(switched[2].requests.at(-1), { model: "gpt-6.1-sol", summary: false });
