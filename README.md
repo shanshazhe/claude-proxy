@@ -213,7 +213,7 @@ Writes use the private exact-byte backups and serialized, conflict-checked atomi
 
 ### Automatic GPT capacity on session start
 
-Claude Code 2.1.303's gateway discovery keeps model IDs, names, and descriptions, but does not use catalog capacity metadata to set GPT's session window. With local GPT credentials available, `lib/claude-launch.js` fetches `/v1/models` on **each session start** (3-second timeout, using the proxy's existing catalog cache) and passes `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the official CLI. It does not patch the official executable, require a pinned CLI version, or save a fixed capacity in global settings.
+Claude Code 2.1.303's gateway discovery keeps model IDs, names, and descriptions, but does not use catalog capacity metadata to set GPT's session window. With local GPT credentials available, `lib/claude-launch.js` fetches `/v1/models?wait_for_refresh=true` on **each session start** (15-second timeout, using the proxy's existing catalog cache and waiting for an expired or missing catalog to refresh within the 12-second upstream deadline) and passes `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the official CLI. It does not patch the official executable, require a pinned CLI version, or save a fixed capacity in global settings.
 
 All three automatic GPT behaviors—subagent defaults sync, capacity launcher installation, and CLI context injection—require the same local GPT credentials: structurally valid saved OAuth, a saved API key, or a nonblank `OPENAI_API_KEY`. Copilot-only credentials do not qualify. An expired OAuth access token still counts as logged in; this check never refreshes tokens or verifies them online. Missing or unreadable credentials skip automatic changes without deleting existing settings or an installed launcher. The launcher then starts the official CLI with the original arguments and environment, including any caller-provided `CLAUDE_CODE_MAX_CONTEXT_TOKENS`; a cached GPT catalog cannot bypass the check.
 
@@ -435,7 +435,7 @@ Copilot's native usage fields, including `cache_read_input_tokens` and `cache_cr
 
 - Anthropic clients cannot directly carry Responses item IDs or encrypted reasoning. The proxy keeps matching native output in **process memory**, scoped to the account, model, session, and history, for replay on later turns. These data are not written to logs or disk.
 - Replay is limited to 512 entries / 16 MiB with least-recently-used eviction. Restarting clears it, and unrelated clients are not arbitrarily mixed.
-- Model discovery coalesces pending requests, limits each source to 12 seconds, and gives clients a response budget of approximately 2.2 seconds. The TTL is five minutes when every source succeeds and 30 seconds when a source fails. A failed source retains previously discovered entries; a source that has never succeeded remains absent.
+- Model discovery coalesces pending requests, limits each source to 12 seconds, and gives ordinary clients a response budget of approximately 2.2 seconds. The session launcher uses `wait_for_refresh=true` to wait for the shared refresh instead of receiving the early cached or empty fallback. The TTL is five minutes when every source succeeds and 30 seconds when a source fails. A failed source retains previously discovered entries; a source that has never succeeded remains absent.
 - Successful login invalidates the catalog generation. An older pending discovery cannot repopulate the current cache.
 - CLI model settings are cached by mtime. This is separate from upstream prompt caching, Responses replay, and Online Summary.
 

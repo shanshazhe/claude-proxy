@@ -1005,7 +1005,8 @@ const server = http.createServer(async (req, res) => {
   // Handle /v1/models
   if (new URL(req.url, "http://localhost").pathname === "/v1/models" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(toGatewayModels(await getAvailableModels())));
+    const waitForRefresh = new URL(req.url, "http://localhost").searchParams.get("wait_for_refresh") === "true";
+    res.end(JSON.stringify(toGatewayModels(await getAvailableModels({ waitForRefresh }))));
     return;
   }
 

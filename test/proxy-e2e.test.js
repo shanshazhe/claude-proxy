@@ -29,6 +29,7 @@ for (const platform of ["mac", "windows"]) {
     const serviceCalls = [];
     const memoryCalls = [];
     const upstream = [];
+    const discoveryOptions = [];
     const usage = { input_tokens: 100, output_tokens: 3, input_tokens_details: { cached_tokens: 64 } };
     const openaiFetch = async (url, options) => {
       const payload = JSON.parse(options.body);
@@ -78,9 +79,10 @@ for (const platform of ["mac", "windows"]) {
           return { enqueue: () => { throw new Error("Unexpected maintenance job in provider routing test"); } };
         } };
         if (name === "../lib/credential-store") return { defaultStore: store };
-        if (name === "../lib/model-discovery") return { createModelDiscovery: () => Object.assign(async () => ({ object: "list", data: [
-          { id: "gpt-test" }, { id: "claude-sonnet-test" }
-        ] }), { invalidate() {} }) };
+        if (name === "../lib/model-discovery") return { createModelDiscovery: () => Object.assign(async (options) => {
+          discoveryOptions.push(options);
+          return { object: "list", data: [{ id: "gpt-test" }, { id: "claude-sonnet-test" }] };
+        }, { invalidate() {} }) };
         if (name === "../lib/auth-server") return { createAuthRouter: (options) => { router = auth.createAuthRouter(options); return router; } };
         if (name === "../lib/claude-setup") return { ...setup, getClaudeConfigRoot: () => configRoot,
           createClaudeSetup: (options) => setup.createClaudeSetup({ ...options, env: {}, configRoot, probe: async () => ({ cli: true, bash: "/bin/bash", jq: "test-jq", node: process.execPath }) }) };
@@ -129,6 +131,12 @@ for (const platform of ["mac", "windows"]) {
     assert.deepEqual(memoryCalls, ["factory", true]);
     const models = await (await fetch(base + "/v1/models?limit=1000")).json();
     assert.deepEqual(models.data.map((model) => model.id), ["anthropic/gpt-test", "claude-sonnet-test"]);
+    assert.equal(discoveryOptions.at(-1)?.waitForRefresh, false);
+    for (const [value, expected] of [["true", true], ["false", false], ["invalid", false]]) {
+      const refreshed = await (await fetch(base + "/v1/models?wait_for_refresh=" + value)).json();
+      assert.deepEqual(refreshed, models);
+      assert.equal(discoveryOptions.at(-1)?.waitForRefresh, expected);
+    }
     const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } };
     for (const model of ["anthropic/gpt-test", "claude-sonnet-test"]) {
       for (const stream of [false, true]) {

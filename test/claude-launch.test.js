@@ -75,7 +75,7 @@ test("all non-model flags pass through without parsing, reading or injecting set
   assert.deepEqual(buildLaunch(unknownCatalog, args, env).args, args);
   assert.equal(await main({ args, env,
     fetchImpl: async (url) => {
-      assert.equal(url, "http://environment/v1/models");
+      assert.equal(url, "http://environment/v1/models?wait_for_refresh=true");
       return { ok: true, json: async () => unknownCatalog };
     },
     probe: async () => ({ claudeCommand: { file: "cli", args: [] } }),
@@ -88,6 +88,42 @@ test("all non-model flags pass through without parsing, reading or injecting set
       process.nextTick(() => child.emit("exit", 3));
       return child;
     } }), 3);
+});
+
+test("session startup allows 15 seconds and adopts a catalog arriving after 3 seconds", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const timeouts = [];
+  t.mock.method(AbortSignal, "timeout", (milliseconds) => {
+    timeouts.push(milliseconds);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new DOMException("timed out", "TimeoutError")), milliseconds);
+    return controller.signal;
+  });
+  let spawned = false;
+  const launching = main({ args: [], env: {},
+    fetchImpl: async (url, { signal }) => {
+      assert.equal(url, "http://localhost:8082/v1/models?wait_for_refresh=true");
+      await new Promise((resolve, reject) => {
+        setTimeout(resolve, 5000);
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+      return { ok: true, json: async () => ({ data: [{ id: "gpt-test", context_window: 872000 }] }) };
+    },
+    probe: async () => ({ claudeCommand: { file: "cli", args: [] } }),
+    spawnImpl: (file, args, options) => {
+      spawned = true;
+      assert.equal(options.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "872000");
+      const child = new EventEmitter();
+      process.nextTick(() => child.emit("exit", 0));
+      return child;
+    } });
+  t.mock.timers.tick(3000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(spawned, false);
+  t.mock.timers.tick(2000);
+  assert.equal(await launching, 0);
+  assert.deepEqual(timeouts, [15000]);
+  assert.equal(spawned, true);
 });
 
 test("catalog failures preserve original arguments and spawn errors are reported", async () => {
@@ -142,7 +178,7 @@ test("catalog HTTP, JSON and timeout failures warn but still start the original 
     const env = { CLAUDE_CODE_MAX_CONTEXT_TOKENS: "123456" };
     const before = process.listenerCount("SIGINT");
     assert.equal(await main({ args, env, fetchImpl: async (url, options) => {
-      assert.equal(url, "http://localhost:8082/v1/models");
+      assert.equal(url, "http://localhost:8082/v1/models?wait_for_refresh=true");
       assert.ok(options.signal instanceof AbortSignal);
       return response();
     }, probe: async () => ({ claudeCommand: { file: "cli", args: [] } }),
@@ -189,7 +225,7 @@ test("successive launches fetch changing catalog capacities for real child proce
   let capacity = 500000;
   let fetched = 0;
   const server = http.createServer((request, response) => {
-    assert.equal(request.url, "/v1/models");
+    assert.equal(request.url, "/v1/models?wait_for_refresh=true");
     fetched++;
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ data: [{ id: "anthropic/gpt-test", context_window: capacity }] }));
