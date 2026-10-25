@@ -45,7 +45,45 @@ test("Responses requests reasoning summaries and respects disabled/non-reasoning
   assert.equal(assembled.reasoning_content, "Public summary");
 });
 
-test("GPT chat routes to Responses; unsupported model IDs do not", () => {
+test("GPT-6.1 Sol preserves all five reasoning effort levels without changing legacy models", () => {
+  for (const model of ["gpt-6.1-sol", "openai/gpt-6.1-sol"]) {
+    for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
+      const reasoning = getResponsesReasoning({ model, thinking: { type: "adaptive" }, output_config: { effort } });
+      assert.deepEqual(reasoning, { summary: "auto", effort }, `${model}: ${effort}`);
+      for (const kind of ["api", "codex", "copilot"]) {
+        assert.deepEqual(toResponsesBody({ model, messages: [], reasoning }, { kind }).reasoning, reasoning);
+      }
+    }
+    assert.deepEqual(getResponsesReasoning({ model, thinking: { type: "adaptive" } }), { summary: "auto", effort: "medium" });
+    assert.equal(getResponsesReasoning({ model, thinking: { type: "disabled" }, output_config: { effort: "max" } }), undefined);
+  }
+  for (const model of ["gpt-5", "openai/gpt-5", "gpt-6.1-sol-other"]) {
+    for (const effort of ["xhigh", "max"]) {
+      assert.deepEqual(getResponsesReasoning({ model, output_config: { effort } }), { summary: "auto", effort: "high" });
+    }
+  }
+});
+
+test("GPT-6.1 Sol sends xhigh and max unchanged in Responses requests", async () => {
+  for (const effort of ["xhigh", "max"]) {
+    const model = "gpt-6.1-sol";
+    const reasoning = getResponsesReasoning({ model, output_config: { effort } });
+    let requests = 0;
+    await requestResponses({ model, messages: [], stream: false, reasoning }, {
+      remember: false,
+      loadAuth: async () => ({ kind: "api", token: "test-only" }),
+      fetchImpl: async (url, options) => {
+        requests++;
+        assert.ok(url.endsWith("/responses"));
+        assert.deepEqual(JSON.parse(options.body).reasoning, { summary: "auto", effort });
+        return { ok: true, json: async () => finalResponse };
+      }
+    });
+    assert.equal(requests, 1);
+  }
+});
+
+test("GPT routes to Responses; NVIDIA GPT OSS does not", () => {
   for (const model of ["gpt-5", "gpt-4.1", "openai/gpt-5", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"]) assert.equal(isResponsesModel(model), true);
   for (const model of ["openai/gpt-oss-120b", "gpt-oss-20b", "z-ai/glm-5.2", undefined]) assert.equal(isResponsesModel(model), false);
 });
