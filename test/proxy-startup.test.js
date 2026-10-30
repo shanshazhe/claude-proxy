@@ -6,8 +6,37 @@ const path = require("path");
 const vm = require("vm");
 const { EventEmitter } = require("events");
 const { createRequire } = require("module");
+const { spawnSync } = require("child_process");
 
 const LAUNCHER_MODULE = "../lib/claude-launcher-install";
+
+test("macOS/Linux launcher passes the system CA flag and quoted proxy path to Node", (t) => {
+  if (process.platform === "win32") return t.skip("Bash launcher requires a Unix host");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "proxy startup-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, "node"), '#!/usr/bin/env bash\nprintf \'%s\\n\' "$@"\n', { mode: 0o700 });
+  const result = spawnSync("bash", [path.resolve("mac/start-proxy.sh")], {
+    cwd: root, env: { ...process.env, PATH: `${root}${path.delimiter}${process.env.PATH || ""}` }, encoding: "utf8"
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.stdout.trim().split(/\r?\n/), [
+    "Open http://127.0.0.1:8082/login to sign in.", "--use-system-ca", path.resolve("mac/proxy.js")
+  ]);
+});
+
+test("Windows launchers include the system CA flag before the proxy path", () => {
+  const normal = fs.readFileSync(path.resolve("windows/start-proxy.bat"), "utf8");
+  assert.match(normal, /start \/min node --use-system-ca "%~dp0proxy\.js"/);
+  const hidden = fs.readFileSync(path.resolve("windows/start-proxy-hidden.bat"), "utf8");
+  assert.match(hidden, /-ArgumentList '--use-system-ca',/);
+});
+
+test("README direct proxy startup examples include the system CA flag", () => {
+  const readme = fs.readFileSync(path.resolve("README.md"), "utf8");
+  const examples = [...readme.matchAll(/\bnode (?:--use-system-ca )?(?:mac\/proxy\.js|windows\\proxy\.js)\b/g)];
+  assert.equal(examples.length, 4);
+  for (const [command] of examples) assert.match(command, /^node --use-system-ca /);
+});
 
 // 在隔离 VM 中完整运行代理脚本：假的 HTTP 服务、假的依赖和临时目录，不监听端口、不读写真实用户目录。
 function startProxy(platform, root, { installer, installerFactory, listen = "success", auth = {},

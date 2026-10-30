@@ -49,7 +49,7 @@ Source layout: `lib/` contains provider, login, secure storage, setup, and cache
 
 ## Prerequisites
 
-1. **Node.js 18.17 or newer.** A currently supported Node.js LTS release is recommended. The implementation requires built-in `fetch`, Web Streams, `structuredClone`, and related APIs.
+1. **Node.js 22.15+ (22.x), or a newer supported LTS release.** The launchers require `--use-system-ca` to include trusted system certificates while keeping TLS verification enabled. The implementation also requires built-in `fetch`, Web Streams, `structuredClone`, and related APIs.
 2. To use the CLI configuration button, install **Claude Code** first and ensure the CLI can be found by the version probe. The gateway does not install it automatically.
 3. At least one type of upstream access:
    - A ChatGPT account that supports Codex device authorization and the requested models, or an OpenAI API key with API quota.
@@ -60,7 +60,7 @@ Successful login does not grant access to every model. Subscriptions, organizati
 
 ## Starting the proxy
 
-Run the following commands from the project root.
+Run the following commands from the project root. Both launchers and the direct-start examples below enable `--use-system-ca`, so the proxy trusts system-installed CAs (including trusted enterprise certificates) without disabling TLS verification. If the required CA is not in the system trust store, install it there or set `NODE_EXTRA_CA_CERTS` to a trusted PEM certificate bundle before starting the proxy.
 
 ### macOS / Linux
 
@@ -72,7 +72,7 @@ bash mac/start-proxy.sh
 Or run the proxy directly:
 
 ```bash
-node mac/proxy.js
+node --use-system-ca mac/proxy.js
 ```
 
 The launcher runs the proxy in the foreground. Keep the terminal open and press `Ctrl+C` to stop it. Then open:
@@ -93,7 +93,7 @@ windows\start-proxy.bat
 The batch launcher uses `start /min node` to start a separate process. To view logs and stop the proxy explicitly, run it in the foreground instead:
 
 ```bat
-node windows\proxy.js
+node --use-system-ca windows\proxy.js
 ```
 
 Open `http://127.0.0.1:8082/login`. The launchers do not install services or modify CLI settings; configuration is performed explicitly through the page button.
@@ -127,7 +127,7 @@ Set `OPENAI_API_KEY` in the process environment before starting the proxy. It ta
 
 ```bash
 # This is a placeholder. Use your own secure environment-injection method.
-OPENAI_API_KEY='<your-api-key>' node mac/proxy.js
+OPENAI_API_KEY='<your-api-key>' node --use-system-ca mac/proxy.js
 ```
 
 Do not put real keys in the repository, screenshots, or shared command history. On Windows, set the variable in the current terminal or through the system environment-variable settings before starting the proxy. Restart the proxy after changing its environment variables.
@@ -147,7 +147,7 @@ On platforms with Unix permissions, the directory uses `0700` and the file uses 
 To import an existing Pi authentication file, explicitly provide `PI_AUTH_FILE`:
 
 ```bash
-PI_AUTH_FILE='/path/to/pi/auth.json' node mac/proxy.js
+PI_AUTH_FILE='/path/to/pi/auth.json' node --use-system-ca mac/proxy.js
 ```
 
 At startup, supported credentials are imported only if the destination `auth.json` does not exist. The source is read-only: it is neither modified nor deleted. Existing or damaged destinations are never overwritten, and conflicts produce a warning. Invalid sources and unsupported entries are not treated as valid credentials. Without `PI_AUTH_FILE`, the proxy does not search for authentication files in the repository.
@@ -532,6 +532,8 @@ A custom `OPENAI_BASE_URL` receives the API key, model requests, and conversatio
 | Symptom | What to check |
 | --- | --- |
 | Proxy cannot listen / port already in use | Ensure only one proxy is running, inspect port 8082, and manually stop any unwanted process |
+| `node: bad option: --use-system-ca` | Upgrade to Node.js 22.15+ (22.x) or a newer supported LTS release, and check which `node` is on PATH |
+| TLS certificate errors / `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` / `SELF_SIGNED_CERT_IN_CHAIN` | Use the launcher or include `--use-system-ca` when starting Node. Ensure the required CA is trusted by the system, or set `NODE_EXTRA_CA_CERTS` to a trusted PEM bundle; do not disable TLS verification |
 | Login page does not open | Use `127.0.0.1:8082/login`; the proxy binds only IPv4 loopback, and localhost / IPv6 resolution may differ by environment |
 | Login status returns 403 | Reload the local page to refresh its nonce; do not use another Host, a proxy, a cross-origin page, or a POST without Origin |
 | Device code expires / login fails | Complete authorization on the official website, check account permissions and network / device-authorization availability, then start again |
