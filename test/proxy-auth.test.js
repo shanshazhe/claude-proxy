@@ -13,7 +13,7 @@ for (const platform of ["mac", "windows"]) {
     assert.match(source, /onCacheUsage/);
     assert.match(source, /createMacosService\(\{ proxyPath: __filename, port: PORT, onHandoff: shutdownProxy \}\)/);
     assert.match(source, /const authRouter = createAuthRouter\(\{[\s\S]*?macosService,/);
-    assert.match(source, /const claudeSetup = createClaudeSetup\(\{ store: credentialStore, getAvailableModels \}\);/);
+    assert.match(source, /const claudeSetup = createClaudeSetup\(\{ store: credentialStore, getAvailableModels, launcherInstaller: claudeLauncherInstaller \}\);/);
     assert.match(source, /setup: claudeSetup,/);
     assert.equal(source.split("claudeSetup.syncGptSubagentModel()").length, 2);
     assert.ok(source.indexOf("claudeSetup.syncGptSubagentModel()") > source.indexOf("server.listen(PORT"));

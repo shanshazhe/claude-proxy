@@ -224,6 +224,65 @@ test("GPT startup sync serializes with web-button writes and preserves all three
   assert.equal(f.read().statusLine.command, "test-statusline-command");
 });
 
+for (const platform of ["darwin", "win32"]) {
+  test(`${platform} first-login CLI configuration installs the skipped capacity launcher without restarting the proxy`,
+    { skip: platform === "darwin" && process.platform === "win32" ? "zsh installation requires Unix permissions" : false }, async (t) => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "claude-onboarding-")));
+    t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+    const configRoot = path.join(home, "cli");
+    const profile = path.join(home, platform === "win32" ? "profile.ps1" : ".zshrc");
+    const auth = {};
+    const store = { readAuth: () => auth };
+    const { createClaudeLauncherInstaller } = require("../lib/claude-launcher-install");
+    const launcherInstaller = createClaudeLauncherInstaller({ home, configRoot, platform, env: { SystemRoot: path.join(home, "Windows") }, store,
+      featureFile: path.join(home, "features.json"),
+      execFileSync: (_file, args) => args.at(-1).includes("$PROFILE.CurrentUserAllHosts") ? profile : process.version });
+    const setup = createClaudeSetup({ configRoot, env: {}, store, launcherInstaller,
+      probe: async () => ({ cli: true }), getAvailableModels: async () => ({ data: [{ id: "gpt-sol-test", context_window: 872000 }] }) });
+    assert.equal(await launcherInstaller.autoEnable(), null);
+    assert.equal(fs.existsSync(profile), false);
+    assert.equal((await setup.getStatus()).claudeCli.ready, false);
+    assert.equal(fs.existsSync(profile), false);
+    auth.openai = { type: "api_key", key: "test-login-key" };
+    assert.equal((await setup.configureCli()).model, "anthropic/gpt-sol-test");
+    assert.match(fs.readFileSync(profile, "utf8"), /claude-launch\.js/);
+    const settings = JSON.parse(fs.readFileSync(path.join(configRoot, "settings.json")));
+    assert.equal(settings.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, undefined);
+    const before = fs.statSync(profile);
+    await setup.configureCli();
+    assert.equal(fs.statSync(profile).ino, before.ino);
+    assert.equal(fs.statSync(profile).mtimeMs, before.mtimeMs);
+    await launcherInstaller.configure(false);
+    const disabled = fs.readFileSync(profile);
+    const result = await setup.configureCli();
+    assert.deepEqual(fs.readFileSync(profile), disabled);
+    assert.equal(launcherInstaller.getStatus().enabled, false);
+    assert.match(result.notice, /context capacity could not be enabled/i);
+  });
+}
+
+test("CLI configuration keeps routing and reports a safe notice when capacity launcher setup fails", async (t) => {
+  for (const outcome of [null, { ok: false, reason: "private-profile-path" }, new Error("private-command-output")]) {
+    let calls = 0;
+    const f = fixture(t, { launcherInstaller: { async autoEnable() {
+      calls++;
+      assert.equal(f.read().env.ANTHROPIC_MODEL, "anthropic/gpt-test");
+      if (outcome instanceof Error) throw outcome;
+      return outcome;
+    } } });
+    const result = await f.setup.configureCli();
+    assert.equal(result.success, true);
+    assert.match(result.notice, /context capacity could not be enabled/i);
+    assert.doesNotMatch(result.notice, /private-/);
+    assert.equal(calls, 1);
+    await f.setup.configureStatusline();
+    assert.equal(calls, 1);
+    f.state.auth = {};
+    await assert.rejects(f.setup.configureCli(), { setupCode: "no-credentials" });
+    assert.equal(calls, 1);
+  }
+});
+
 test("read-only status uses cached probes, never models or configuration writes, and credentials gate only CLI", async (t) => {
   const f = fixture(t);
   f.state.auth = {};

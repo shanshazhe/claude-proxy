@@ -94,7 +94,8 @@ function startProxy(platform, root, { installer, installerFactory, listen = "suc
       if (name === "../lib/claude-setup") return { ...nativeRequire(name), getClaudeConfigRoot: () => configRoot,
         createClaudeSetup: (options) => {
           calls.setupFactory++;
-          const setup = nativeRequire(name).createClaudeSetup({ ...options, configRoot, env: {}, store, getAvailableModels });
+          const setup = nativeRequire(name).createClaudeSetup({ ...options, configRoot, env: {}, store, getAvailableModels,
+            probe: async () => ({ cli: true }) });
           const synchronize = setup.syncGptSubagentModel;
           setup.syncGptSubagentModel = () => {
             calls.syncGpt++;
@@ -137,6 +138,23 @@ for (const platform of ["mac", "windows"]) {
     assert.equal(run.warns.some((line) => line.includes("claude-launcher")), false);
     assert.equal(run.calls.autoEnableBeforeListen, 0);
     assert.equal(fs.existsSync(run.featureFile), false);
+  });
+
+  test(`${platform} Configure Claude CLI retries launcher installation after first login`, async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-onboarding-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const auth = {};
+    const run = startProxy(platform, root, { auth,
+      catalog: async () => ({ data: [{ id: "gpt-sol-test", context_window: 872000 }] }),
+      installer: () => auth.openai ? { ok: true, enabled: true, state: "installed" } : null });
+    await tick();
+    assert.equal(run.calls.autoEnable, 1);
+    auth.openai = { type: "api_key", key: "test-first-login" };
+    await run.calls.authSetup.configureCli();
+    assert.equal(run.calls.factory, 1);
+    assert.equal(run.calls.autoEnable, 2);
+    assert.equal(run.calls.autoEnableBeforeListen, 0);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(run.configRoot, "settings.json"))).env.ANTHROPIC_MODEL, "anthropic/gpt-sol-test");
   });
 
   test(`${platform} startup does not start the launcher installer when listen fails`, async (t) => {
