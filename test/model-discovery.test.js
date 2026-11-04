@@ -5,6 +5,79 @@ const { createModelDiscovery } = require("../lib/model-discovery");
 const ok = (data) => ({ ok: true, json: async () => data });
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
+for (const kind of ["api", "codex"]) {
+  test(`GPT-only discovery never probes Copilot and caches independently (${kind})`, async () => {
+    let clock = 0;
+    let calls = 0;
+    const getModels = createModelDiscovery({
+      gptOnly: true,
+      now: () => clock,
+      loadClaudeAuth: async () => assert.fail("must not load Copilot auth"),
+      loadAuth: async () => ({ kind, token: "fixture", accountId: "fixture-account" }),
+      onWarning: () => assert.fail("unused providers must not produce warnings"),
+      fetchImpl: async (url) => {
+        calls++;
+        assert.ok(url.includes(kind === "codex" ? "/backend-api/codex/models?" : "/models"));
+        const model = { id: "gpt-test", slug: "gpt-test", context_window: 872000 };
+        return ok(kind === "codex" ? { models: [model] } : { data: [model] });
+      }
+    });
+    const initial = await getModels({ waitForRefresh: true });
+    assert.equal(initial.data[0].context_window, 872000);
+    clock = 30001;
+    assert.strictEqual(await getModels({ waitForRefresh: true }), initial);
+    assert.equal(calls, 1, "unused providers must not shorten the successful cache to 30s");
+    getModels.invalidate();
+    await getModels({ waitForRefresh: true });
+    assert.equal(calls, 2);
+  });
+}
+
+test("GPT-only discovery does not reuse a failed full catalog's empty cache", async () => {
+  let fail = true;
+  let calls = 0;
+  const options = {
+    loadClaudeAuth: async () => { throw new Error("no Copilot fixture"); },
+    loadAuth: async () => ({ kind: "api", token: "fixture" }),
+    fetchImpl: async () => {
+      calls++;
+      if (fail) throw new Error("offline");
+      return ok({ data: [{ id: "gpt-test", context_window: 872000 }] });
+    }
+  };
+  const full = createModelDiscovery(options);
+  const gpt = createModelDiscovery({ ...options, gptOnly: true });
+  assert.deepEqual((await full({ waitForRefresh: true })).data, []);
+  fail = false;
+  assert.equal((await gpt({ waitForRefresh: true })).data[0].context_window, 872000);
+  assert.deepEqual((await full({ waitForRefresh: true })).data, []);
+  assert.equal(calls, 2);
+});
+
+test("GPT-only startup waits past 2.2s but retains the 12s upstream deadline", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let signal;
+  const warnings = [];
+  const getModels = createModelDiscovery({
+    gptOnly: true,
+    loadAuth: async () => ({ kind: "api", token: "fixture" }),
+    loadClaudeAuth: async () => assert.fail("must not load Copilot auth"),
+    onWarning: (source, message) => warnings.push([source, message]),
+    fetchImpl: async (_url, options) => { signal = options.signal; return new Promise(() => {}); }
+  });
+  let result;
+  const waiting = getModels({ waitForRefresh: true }).then((value) => { result = value; });
+  await flush();
+  t.mock.timers.tick(2200);
+  await flush();
+  assert.equal(result, undefined);
+  t.mock.timers.tick(9800);
+  await waiting;
+  assert.deepEqual(result.data, []);
+  assert.equal(signal.aborted, true);
+  assert.deepEqual(warnings, [["OpenAI Responses", "Model discovery timed out"]]);
+});
+
 for (const options of [undefined, { waitForRefresh: false }]) {
   test(`discovery keeps the 2.2s empty fallback with ${JSON.stringify(options)} options`, async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout"] });

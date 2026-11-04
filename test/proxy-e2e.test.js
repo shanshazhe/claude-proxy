@@ -30,6 +30,8 @@ for (const platform of ["mac", "windows"]) {
     const memoryCalls = [];
     const upstream = [];
     const discoveryOptions = [];
+    const invalidations = [];
+    let authOptions;
     const usage = { input_tokens: 100, output_tokens: 3, input_tokens_details: { cached_tokens: 64 } };
     const openaiFetch = async (url, options) => {
       const payload = JSON.parse(options.body);
@@ -79,11 +81,12 @@ for (const platform of ["mac", "windows"]) {
           return { enqueue: () => { throw new Error("Unexpected maintenance job in provider routing test"); } };
         } };
         if (name === "../lib/credential-store") return { defaultStore: store };
-        if (name === "../lib/model-discovery") return { createModelDiscovery: () => Object.assign(async (options) => {
-          discoveryOptions.push(options);
-          return { object: "list", data: [{ id: "gpt-test" }, { id: "claude-sonnet-test" }] };
-        }, { invalidate() {} }) };
-        if (name === "../lib/auth-server") return { createAuthRouter: (options) => { router = auth.createAuthRouter(options); return router; } };
+        if (name === "../lib/model-discovery") return { createModelDiscovery: ({ gptOnly = false } = {}) => Object.assign(async (options) => {
+          discoveryOptions.push({ ...options, gptOnly });
+          return { object: "list", data: gptOnly ? [{ id: "gpt-test", context_window: 872000 }]
+            : [{ id: "gpt-test" }, { id: "claude-sonnet-test" }] };
+        }, { invalidate: () => invalidations.push(gptOnly) }) };
+        if (name === "../lib/auth-server") return { createAuthRouter: (options) => { authOptions = options; router = auth.createAuthRouter(options); return router; } };
         if (name === "../lib/claude-setup") return { ...setup, getClaudeConfigRoot: () => configRoot,
           createClaudeSetup: (options) => setup.createClaudeSetup({ ...options, env: {}, configRoot, probe: async () => ({ cli: true, bash: "/bin/bash", jq: "test-jq", node: process.execPath }) }) };
         if (name === "../lib/online-summary") return { ...observations,
@@ -132,11 +135,21 @@ for (const platform of ["mac", "windows"]) {
     const models = await (await fetch(base + "/v1/models?limit=1000")).json();
     assert.deepEqual(models.data.map((model) => model.id), ["anthropic/gpt-test", "claude-sonnet-test"]);
     assert.equal(discoveryOptions.at(-1)?.waitForRefresh, false);
+    assert.equal(discoveryOptions.at(-1)?.gptOnly, false);
     for (const [value, expected] of [["true", true], ["false", false], ["invalid", false]]) {
       const refreshed = await (await fetch(base + "/v1/models?wait_for_refresh=" + value)).json();
       assert.deepEqual(refreshed, models);
       assert.equal(discoveryOptions.at(-1)?.waitForRefresh, expected);
+      assert.equal(discoveryOptions.at(-1)?.gptOnly, false);
+      const scoped = await (await fetch(base + "/v1/models?provider=gpt&wait_for_refresh=" + value)).json();
+      assert.deepEqual(scoped.data.map((model) => model.id), ["anthropic/gpt-test"]);
+      assert.equal(scoped.data[0].context_window, 872000);
+      assert.equal(discoveryOptions.at(-1)?.waitForRefresh, expected);
+      assert.equal(discoveryOptions.at(-1)?.gptOnly, true);
     }
+    assert.deepEqual(await (await fetch(base + "/v1/models")).json(), models, "GPT-only requests must not narrow the /model menu");
+    authOptions.onCredentialsChanged();
+    assert.deepEqual(invalidations.sort(), [false, true], "credential changes invalidate both independent caches");
     const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } };
     for (const model of ["anthropic/gpt-test", "claude-sonnet-test"]) {
       for (const stream of [false, true]) {

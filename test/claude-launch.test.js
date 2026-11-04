@@ -49,13 +49,26 @@ test("raw and prefixed GPT selections launch with the catalog identity without i
   assert.deepEqual(buildLaunch(catalog, args, {}).args, args);
 });
 
-test("--model wins over the environment, and a Claude start keeps a window for later raw GPT switches", () => {
-  for (const args of [["--model", "claude-opus-4.8"], ["--model=claude-opus-4.8[1m]"]]) {
-    const launch = buildLaunch(catalog, args, { ANTHROPIC_MODEL: "gpt-small" });
-    assert.deepEqual(launch.args, ["--model", "claude-opus-4.8[1m]"]);
-    assert.equal(launch.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "400000");
+test("explicit non-GPT selections win over the environment without rewriting aliases or borrowing GPT capacity", () => {
+  for (const model of ["claude-opus-4.8", "claude-opus-4.8[1m]", "qwen/test", "unknown"]) {
+    for (const args of [["--model", model], ["--model=" + model]]) {
+      const launch = buildLaunch(catalog, args, { ANTHROPIC_MODEL: "gpt-small" });
+      assert.deepEqual(launch.args, args);
+      assert.equal(launch.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, undefined);
+    }
+    const launch = buildLaunch(catalog, [], { ANTHROPIC_MODEL: model });
+    assert.deepEqual(launch.args, []);
+    assert.equal(launch.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, undefined);
   }
   assert.equal(buildLaunch(catalog, [], { ANTHROPIC_MODEL: "gpt-small" }).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "400000");
+});
+
+test("only GPT metadata determines capacity even if the server returns mixed providers", () => {
+  const mixed = { data: [...catalog.data, { id: "qwen/test", context_window: 32000 }] };
+  assert.equal(buildLaunch(mixed, [], {}).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "400000");
+  for (const data of [[{ id: "qwen/test", context_window: 32000 }], [{ id: "gpt-no-limit", max_context_window: 872000 }]]) {
+    assert.equal(buildLaunch({ data }, [], {}).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, data[0].id.startsWith("gpt-") ? "872000" : undefined);
+  }
 });
 
 test("unknown models, caller limits and the prompt after -- remain untouched", () => {
@@ -75,7 +88,7 @@ test("all non-model flags pass through without parsing, reading or injecting set
   assert.deepEqual(buildLaunch(unknownCatalog, args, env).args, args);
   assert.equal(await main({ args, env,
     fetchImpl: async (url) => {
-      assert.equal(url, "http://environment/v1/models?wait_for_refresh=true");
+      assert.equal(url, "http://environment/v1/models?provider=gpt&wait_for_refresh=true");
       return { ok: true, json: async () => unknownCatalog };
     },
     probe: async () => ({ claudeCommand: { file: "cli", args: [] } }),
@@ -102,7 +115,7 @@ test("session startup allows 15 seconds and adopts a catalog arriving after 3 se
   let spawned = false;
   const launching = main({ args: [], env: {},
     fetchImpl: async (url, { signal }) => {
-      assert.equal(url, "http://localhost:8082/v1/models?wait_for_refresh=true");
+      assert.equal(url, "http://localhost:8082/v1/models?provider=gpt&wait_for_refresh=true");
       await new Promise((resolve, reject) => {
         setTimeout(resolve, 5000);
         signal.addEventListener("abort", () => reject(signal.reason), { once: true });
@@ -178,7 +191,7 @@ test("catalog HTTP, JSON and timeout failures warn but still start the original 
     const env = { CLAUDE_CODE_MAX_CONTEXT_TOKENS: "123456" };
     const before = process.listenerCount("SIGINT");
     assert.equal(await main({ args, env, fetchImpl: async (url, options) => {
-      assert.equal(url, "http://localhost:8082/v1/models?wait_for_refresh=true");
+      assert.equal(url, "http://localhost:8082/v1/models?provider=gpt&wait_for_refresh=true");
       assert.ok(options.signal instanceof AbortSignal);
       return response();
     }, probe: async () => ({ claudeCommand: { file: "cli", args: [] } }),
@@ -225,7 +238,7 @@ test("successive launches fetch changing catalog capacities for real child proce
   let capacity = 500000;
   let fetched = 0;
   const server = http.createServer((request, response) => {
-    assert.equal(request.url, "/v1/models?wait_for_refresh=true");
+    assert.equal(request.url, "/v1/models?provider=gpt&wait_for_refresh=true");
     fetched++;
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ data: [{ id: "anthropic/gpt-test", context_window: capacity }] }));

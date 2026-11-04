@@ -93,7 +93,8 @@ test("only an exact stale PowerShell template is upgraded", async (t) => {
   const f = fixture(t, { repoRoot: path.resolve(os.tmpdir(), "old repo") });
   assert.equal((await f.installer.autoEnable()).ok, true);
   const installer = createClaudeLauncherInstaller({ home: f.home, configRoot: f.configRoot, featureFile: f.featureFile,
-    platform: "win32", env: process.env, store, execFileSync(file, args, settings) {
+    platform: "win32", env: { ...process.env, SystemRoot: process.platform === "win32" ? process.env.SystemRoot : path.join(f.home, "Windows") },
+    store, execFileSync(file, args, settings) {
       if (args.at(-1).includes?.("$PROFILE.CurrentUserAllHosts")) return f.target;
       return process.platform === "win32" ? execFileSync(file, args, settings) : process.version;
     } });

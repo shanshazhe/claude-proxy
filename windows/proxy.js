@@ -24,6 +24,10 @@ const PORT = 8082;
 const getAvailableModels = createModelDiscovery({
   onWarning: (provider, message) => console.warn(`Model catalog fallback (${provider}): ${message}`)
 });
+const getGptModels = createModelDiscovery({
+  gptOnly: true,
+  onWarning: (provider, message) => console.warn(`Startup model catalog fallback (${provider}): ${message}`)
+});
 const summaryModel = createSummaryModel({
   getAvailableModels,
   // 页面选择的模型每次请求重新读取，修改无需重启代理。
@@ -971,7 +975,10 @@ const authRouter = createAuthRouter({
   setup: claudeSetup,
   summarySettings: createSummarySettings({ getDefaultModel: summaryModel.getDefaultModel, listModels: summaryModel.listModels,
     defaultPrompt: DEFAULT_SUMMARY_PROMPT }),
-  onCredentialsChanged: () => getAvailableModels.invalidate()
+  onCredentialsChanged: () => {
+    getAvailableModels.invalidate();
+    getGptModels.invalidate();
+  }
 });
 
 const server = http.createServer(async (req, res) => {
@@ -1002,11 +1009,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Handle /v1/models
-  if (new URL(req.url, "http://localhost").pathname === "/v1/models" && req.method === "GET") {
+  // Handle /v1/models; startup capacity queries never initiate other providers.
+  const requestUrl = new URL(req.url, "http://localhost");
+  if (requestUrl.pathname === "/v1/models" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    const waitForRefresh = new URL(req.url, "http://localhost").searchParams.get("wait_for_refresh") === "true";
-    res.end(JSON.stringify(toGatewayModels(await getAvailableModels({ waitForRefresh }))));
+    const waitForRefresh = requestUrl.searchParams.get("wait_for_refresh") === "true";
+    const discoverModels = requestUrl.searchParams.get("provider") === "gpt" ? getGptModels : getAvailableModels;
+    res.end(JSON.stringify(toGatewayModels(await discoverModels({ waitForRefresh }))));
     return;
   }
 
