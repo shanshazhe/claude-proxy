@@ -965,7 +965,7 @@ async function answerWebSearch(anthropicBody, search, model, requestId, res) {
 const macosService = createMacosService({ proxyPath: __filename, port: PORT, onHandoff: shutdownProxy });
 const projectMemoryInstaller = createProjectMemoryInstaller({ configRoot: getClaudeConfigRoot() });
 const claudeLauncherInstaller = createClaudeLauncherInstaller({ store: credentialStore });
-const claudeSetup = createClaudeSetup({ store: credentialStore, getAvailableModels, launcherInstaller: claudeLauncherInstaller });
+const claudeSetup = createClaudeSetup({ store: credentialStore, getAvailableModels, getGptModels, launcherInstaller: claudeLauncherInstaller });
 const authRouter = createAuthRouter({
   port: PORT,
   macosService,
@@ -975,9 +975,13 @@ const authRouter = createAuthRouter({
   setup: claudeSetup,
   summarySettings: createSummarySettings({ getDefaultModel: summaryModel.getDefaultModel, listModels: summaryModel.listModels,
     defaultPrompt: DEFAULT_SUMMARY_PROMPT }),
-  onCredentialsChanged: () => {
+  onCredentialsChanged: (provider) => {
     getAvailableModels.invalidate();
     getGptModels.invalidate();
+    if (!["openai", "openai-codex"].includes(provider)) return;
+    return claudeSetup.syncGptContextCapacity().then((result) => {
+      if (result.success) logEvent("claude-setup", "GPT context capacity saved", { tokens: result.tokens });
+    }).catch(() => logWarn("claude-setup", "GPT context capacity sync failed; existing settings were kept. Retry by logging in again."));
   }
 });
 
@@ -1180,6 +1184,10 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`凭据存储目录：${credentialStore.directory}`);
   // 仅在监听成功后异步同步 GPT 子代理默认模型；失败保留原配置，不输出可能包含凭据的错误。
   claudeSetup.syncGptSubagentModel().catch(() => logWarn("claude-setup", "GPT subagent model sync failed; existing settings were kept. Retry on next proxy startup."));
+  // 已登录 GPT 时异步探测并保存最大容量；未登录跳过，失败保留旧值，重启后重试。
+  claudeSetup.syncGptContextCapacity().then((result) => {
+    if (result.success) logEvent("claude-setup", "GPT context capacity saved", { tokens: result.tokens });
+  }).catch(() => logWarn("claude-setup", "GPT context capacity sync failed; existing settings were kept. Retry on next proxy startup or login."));
   // 仅在监听成功后、不阻塞启动地检查 zsh 启动器；显式关闭、配置不安全或平台不支持时不安装。
   claudeLauncherInstaller.autoEnable().then((result) => {
     if (result?.ok === false) logWarn("claude-launcher", "Claude launcher automatic setup failed", { reason: result.reason });

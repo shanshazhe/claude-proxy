@@ -21,6 +21,147 @@ function fixture(t, options = {}) {
   return { root, settingsFile, state, base, setup, read: () => JSON.parse(fs.readFileSync(settingsFile, "utf8")),
     write: (value) => fs.writeFileSync(settingsFile, typeof value === "string" ? value : JSON.stringify(value)) };
 }
+test("GPT post-login capacity sync saves the largest valid GPT window with an exact backup and no unrelated changes", async (t) => {
+  const f = fixture(t);
+  const original = { env: { KEEP: "yes", ANTHROPIC_MODEL: "anthropic/gpt-small", ANTHROPIC_BASE_URL: "https://unchanged.test",
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: "123456" }, model: "personal-model", permissions: { allow: ["Read"] }, extra: true };
+  const bytes = Buffer.from("﻿" + JSON.stringify(original, null, 4) + "\n");
+  fs.writeFileSync(f.settingsFile, bytes);
+  let discoveries = 0;
+  const setup = createClaudeSetup({ ...f.base, getAvailableModels: async () => assert.fail("must use the GPT-only catalog"),
+    getGptModels: async (options) => {
+      discoveries++;
+      assert.deepEqual(options, { waitForRefresh: true });
+      return { data: [
+        { id: "gpt-small", context_window: 400000 },
+        { id: "gpt-invalid", context_window: Number.MAX_SAFE_INTEGER + 1 },
+        { id: "anthropic/gpt-largest[1m]", context_window: 600000, max_context_window: 1200000 },
+        { id: "gpt-medium", runtime: { max_input_tokens: 872000 } },
+        { id: "gpt-other", capabilities: { limits: { max_context_window_tokens: 900000 } } },
+        { id: "claude-test", context_window: 2000000 },
+        { id: "gpt-oss-120b", context_window: 4000000 }, null, {}
+      ] };
+    } });
+  assert.deepEqual(await setup.syncGptContextCapacity(), { success: true, tokens: 1200000 });
+  assert.deepEqual(f.read(), { ...original, env: { ...original.env, CLAUDE_CODE_MAX_CONTEXT_TOKENS: "1200000" } });
+  assert.equal(f.state.probes, 0);
+  assert.equal(f.state.deployed, 0);
+  const backups = path.join(f.root, "claude-proxy", "settings-backups");
+  const names = fs.readdirSync(backups);
+  assert.equal(names.length, 1);
+  assert.deepEqual(fs.readFileSync(path.join(backups, names[0])), bytes);
+  const saved = fs.readFileSync(f.settingsFile);
+  const before = fs.statSync(f.settingsFile);
+  await setup.syncGptContextCapacity();
+  assert.equal(discoveries, 2);
+  assert.deepEqual(fs.readFileSync(f.settingsFile), saved);
+  assert.equal(fs.statSync(f.settingsFile).ino, before.ino);
+  assert.equal(fs.statSync(f.settingsFile).mtimeMs, before.mtimeMs);
+  assert.deepEqual(fs.readdirSync(backups), names);
+});
+
+test("GPT post-login capacity sync creates only settings in the actual custom configuration root", async (t) => {
+  const f = fixture(t);
+  const configRoot = path.join(f.root, "custom", "cli");
+  const setup = createClaudeSetup({ ...f.base, configRoot,
+    getGptModels: async () => ({ data: [{ id: "gpt-test", context_window: 872000 }] }) });
+  await setup.syncGptContextCapacity();
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(configRoot, "settings.json"))), {
+    env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: "872000" }
+  });
+  assert.equal(fs.existsSync(f.settingsFile), false);
+  assert.equal(f.state.probes, 0);
+  assert.deepEqual(fs.readdirSync(path.join(configRoot, "claude-proxy", "settings-backups")), []);
+});
+
+test("GPT post-login capacity sync skips without GPT credentials before touching settings or discovery", async (t) => {
+  for (const auth of [{}, { "github-copilot": { type: "oauth", access: "access", refresh: "refresh", expires: 0 } }]) {
+    const f = fixture(t);
+    f.state.auth = auth;
+    f.write("invalid-settings-must-not-be-read");
+    const setup = createClaudeSetup({ ...f.base,
+      fsImpl: { ...fs, lstatSync() { assert.fail("must not read settings"); } },
+      getGptModels: async () => assert.fail("must not discover models") });
+    assert.equal((await setup.syncGptContextCapacity()).skipped, true);
+    assert.equal(fs.readFileSync(f.settingsFile, "utf8"), "invalid-settings-must-not-be-read");
+  }
+});
+
+test("GPT post-login capacity sync preserves old settings on unavailable or invalid GPT capacity", async (t) => {
+  const f = fixture(t);
+  const original = '{ "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "123456" }, "keep": true }\n';
+  f.write(original);
+  const invalid = [undefined, null, 0, -1, 1.5, "400000", NaN, Infinity, Number.MAX_SAFE_INTEGER + 1];
+  for (const getGptModels of [async () => ({}), async () => ({ data: [] }), async () => ({ data: {} }),
+    async () => ({ data: [{ id: "claude-test", context_window: 2000000 }, null, {},
+      ...invalid.map((context_window) => ({ id: "gpt-invalid", context_window }))] }),
+    async () => { throw new Error("private-upstream-secret"); }]) {
+    const setup = createClaudeSetup({ ...f.base, getGptModels });
+    await assert.rejects(setup.syncGptContextCapacity(), (error) => {
+      assert.equal(error.setupCode, "models");
+      assert.doesNotMatch(error.message, /private/);
+      return true;
+    });
+    assert.equal(fs.readFileSync(f.settingsFile, "utf8"), original);
+    assert.deepEqual(fs.readdirSync(f.root), ["settings.json"]);
+  }
+});
+
+test("GPT post-login capacity sync merges the latest settings and rechecks credentials before saving", async (t) => {
+  const f = fixture(t);
+  f.write({ env: { KEEP: "original" } });
+  const latest = { env: { KEEP: "latest", ANTHROPIC_MODEL: "gpt-personal" }, permissions: { deny: ["Bash"] } };
+  const setup = createClaudeSetup({ ...f.base, getGptModels: async () => {
+    f.write(latest);
+    return { data: [{ id: "gpt-test", context_window: 872000 }] };
+  } });
+  await setup.syncGptContextCapacity();
+  assert.deepEqual(f.read(), { ...latest, env: { ...latest.env, CLAUDE_CODE_MAX_CONTEXT_TOKENS: "872000" } });
+  const saved = fs.readFileSync(f.settingsFile);
+  const vanished = createClaudeSetup({ ...f.base, getGptModels: async () => {
+    f.state.auth = {};
+    return { data: [{ id: "gpt-test", context_window: 1200000 }] };
+  } });
+  assert.equal((await vanished.syncGptContextCapacity()).skipped, true);
+  assert.deepEqual(fs.readFileSync(f.settingsFile), saved);
+});
+
+test("a previous pending GPT capacity sync cannot overwrite a newer login's result", async (t) => {
+  const f = fixture(t);
+  let complete;
+  let calls = 0;
+  const setup = createClaudeSetup({ ...f.base, getGptModels: async () => {
+    if (++calls === 1) return new Promise((resolve) => { complete = resolve; });
+    return { data: [{ id: "gpt-new", context_window: 900000 }] };
+  } });
+  const earlier = setup.syncGptContextCapacity();
+  await setup.syncGptContextCapacity();
+  complete({ data: [{ id: "gpt-old", context_window: 1200000 }] });
+  assert.equal((await earlier).skipped, true);
+  assert.equal(f.read().env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "900000");
+});
+
+test("GPT post-login capacity sync preserves unsafe settings and sanitizes save failures", async (t) => {
+  const f = fixture(t);
+  const getGptModels = async () => ({ data: [{ id: "gpt-test", context_window: 872000 }] });
+  for (const value of ["damaged", '{"env":[]}', '{"env":{"KEY":42}}']) {
+    f.write(value);
+    await assert.rejects(createClaudeSetup({ ...f.base, getGptModels }).syncGptContextCapacity(), { setupCode: "settings" });
+    assert.equal(fs.readFileSync(f.settingsFile, "utf8"), value);
+  }
+  const original = '{ "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "123456" } }\n';
+  f.write(original);
+  const failed = createClaudeSetup({ ...f.base, getGptModels,
+    fsImpl: { ...fs, renameSync() { throw new Error("private-save-error"); } } });
+  await assert.rejects(failed.syncGptContextCapacity(), (error) => {
+    assert.equal(error.setupCode, "save");
+    assert.doesNotMatch(error.message, /private/);
+    return true;
+  });
+  assert.equal(fs.readFileSync(f.settingsFile, "utf8"), original);
+  assert.equal(fs.readdirSync(f.root).some((name) => name.endsWith(".tmp")), false);
+});
+
 test("GPT startup sync merges only subagent env, backs up exact bytes and is idempotent", async (t) => {
   const f = fixture(t);
   const original = { env: { OTHER: "keep", ANTHROPIC_MODEL: "claude-opus-5-5", ANTHROPIC_BASE_URL: "https://unchanged.test",
@@ -212,15 +353,17 @@ test("GPT startup sync safely rejects save failures and final-snapshot races", a
   assert.equal(fs.readdirSync(f.root).some((name) => name.endsWith(".tmp")), false);
 });
 
-test("GPT startup sync serializes with web-button writes and preserves all three merges", async (t) => {
+test("GPT startup and post-login capacity sync serialize with web-button writes and preserve all four merges", async (t) => {
   const f = fixture(t);
   f.write({ env: { KEEP: "yes" } });
-  const second = createClaudeSetup(f.base);
-  await Promise.all([f.setup.configureCli(), second.syncGptSubagentModel(), second.configureStatusline()]);
+  const second = createClaudeSetup({ ...f.base,
+    getGptModels: async () => ({ data: [{ id: "gpt-test", context_window: 872000 }] }) });
+  await Promise.all([f.setup.configureCli(), second.syncGptSubagentModel(), second.syncGptContextCapacity(), second.configureStatusline()]);
   assert.equal(f.read().env.KEEP, "yes");
   assert.equal(f.read().env.ANTHROPIC_BASE_URL, "http://localhost:8082");
   assert.equal(f.read().env.CLAUDE_CODE_SUBAGENT_MODEL, "anthropic/gpt-test");
   assert.equal(f.read().env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE, "1");
+  assert.equal(f.read().env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "872000");
   assert.equal(f.read().statusLine.command, "test-statusline-command");
 });
 

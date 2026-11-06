@@ -13,10 +13,12 @@ for (const platform of ["mac", "windows"]) {
     assert.match(source, /onCacheUsage/);
     assert.match(source, /createMacosService\(\{ proxyPath: __filename, port: PORT, onHandoff: shutdownProxy \}\)/);
     assert.match(source, /const authRouter = createAuthRouter\(\{[\s\S]*?macosService,/);
-    assert.match(source, /const claudeSetup = createClaudeSetup\(\{ store: credentialStore, getAvailableModels, launcherInstaller: claudeLauncherInstaller \}\);/);
+    assert.match(source, /const claudeSetup = createClaudeSetup\(\{ store: credentialStore, getAvailableModels, getGptModels, launcherInstaller: claudeLauncherInstaller \}\);/);
     assert.match(source, /setup: claudeSetup,/);
     assert.equal(source.split("claudeSetup.syncGptSubagentModel()").length, 2);
     assert.ok(source.indexOf("claudeSetup.syncGptSubagentModel()") > source.indexOf("server.listen(PORT"));
+    assert.equal(source.split("claudeSetup.syncGptContextCapacity()").length, 3);
+    assert.ok(source.lastIndexOf("claudeSetup.syncGptContextCapacity()") > source.indexOf("server.listen(PORT"));
     assert.match(source, /syncClaudeSettings\(\);/);
     assert.doesNotMatch(source, /macosService\.configure\(/);
     assert.match(source, /projectMemory: projectMemoryInstaller/);

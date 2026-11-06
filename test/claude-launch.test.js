@@ -17,18 +17,34 @@ const catalog = { data: [
   { id: "claude-haiku-4.5", context_window: 200000 }
 ] };
 
-test("ordinary settings-selected launches use the shared valid GPT window without selecting a model", () => {
+test("ordinary settings-selected launches use the largest valid GPT window without selecting a model", () => {
   const args = ["--settings", "private settings.json", "--setting-sources", "user,project", "-p", "hello", "--", "--model=gpt-small"];
   const env = { KEEP: "yes" };
   const launch = buildLaunch(catalog, args, env);
   assert.deepEqual(launch.args, args);
-  assert.deepEqual(launch.env, { KEEP: "yes", CLAUDE_CODE_MAX_CONTEXT_TOKENS: "400000" });
+  assert.deepEqual(launch.env, { KEEP: "yes", CLAUDE_CODE_MAX_CONTEXT_TOKENS: "872000" });
   assert.deepEqual(env, { KEEP: "yes" });
   assert.equal(buildLaunch(catalog, [], { CLAUDE_CODE_MAX_CONTEXT_TOKENS: "123456" }).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "123456");
   const mixed = { data: [...catalog.data, { id: "gpt-invalid", context_window: "100" }] };
-  assert.equal(buildLaunch(mixed, [], {}).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "400000");
+  assert.equal(buildLaunch(mixed, [], {}).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "872000");
   for (const data of [[{ id: "gpt-invalid" }], [{ id: "claude-opus-4.8", context_window: 1000000 }]]) {
     assert.deepEqual(buildLaunch({ data }, [], {}).env, {});
+  }
+});
+
+test("ordinary launches scan every GPT model for the largest valid capacity regardless of order", () => {
+  const data = [
+    { id: "gpt-small", context_window: 400000 },
+    { id: "gpt-invalid", context_window: Number.MAX_SAFE_INTEGER + 1 },
+    { id: "anthropic/gpt-largest", context_window: 600000, max_context_window: 1200000 },
+    { id: "claude-test", context_window: 2000000 },
+    { id: "qwen/test", context_window: 4000000 },
+    { id: "gpt-medium", runtime: { max_input_tokens: 872000 } }
+  ];
+  for (const models of [data, [...data].reverse()]) {
+    const launch = buildLaunch({ data: models }, [], {});
+    assert.deepEqual(launch.args, []);
+    assert.equal(launch.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "1200000");
   }
 });
 
@@ -65,7 +81,7 @@ test("explicit non-GPT selections win over the environment without rewriting ali
 
 test("only GPT metadata determines capacity even if the server returns mixed providers", () => {
   const mixed = { data: [...catalog.data, { id: "qwen/test", context_window: 32000 }] };
-  assert.equal(buildLaunch(mixed, [], {}).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "400000");
+  assert.equal(buildLaunch(mixed, [], {}).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "872000");
   for (const data of [[{ id: "qwen/test", context_window: 32000 }], [{ id: "gpt-no-limit", max_context_window: 872000 }]]) {
     assert.equal(buildLaunch({ data }, [], {}).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, data[0].id.startsWith("gpt-") ? "872000" : undefined);
   }
@@ -178,7 +194,7 @@ test("non-session commands bypass catalog discovery and preserve all arguments a
   // Help-like text and command names used as option values or prompts are not subcommands.
   for (const args of [["--system-prompt", "--help", "-p", "hi"], ["--settings", "update", "-p", "hi"],
     ["-p", "update"], ["--", "update"], ["hello", "--version"]]) {
-    assert.equal(buildLaunch(catalog, args, {}).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "400000");
+    assert.equal(buildLaunch(catalog, args, {}).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "872000");
   }
 });
 
@@ -229,7 +245,7 @@ test("invalid catalogs warn and fall back to the original CLI context", async (t
   assert.ok(warnings.every((message) => /model catalog unavailable/.test(message)));
 });
 
-test("successive launches fetch changing catalog capacities for real child processes", async (t) => {
+test("successive launches pass the largest changing GPT capacity to real child processes", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "claude-launch-test-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const fixture = path.join(directory, "fake cli.cjs");
@@ -241,7 +257,10 @@ test("successive launches fetch changing catalog capacities for real child proce
     assert.equal(request.url, "/v1/models?provider=gpt&wait_for_refresh=true");
     fetched++;
     response.writeHead(200, { "Content-Type": "application/json" });
-    response.end(JSON.stringify({ data: [{ id: "anthropic/gpt-test", context_window: capacity }] }));
+    response.end(JSON.stringify({ data: [
+      { id: "gpt-small", context_window: 400000 },
+      { id: "anthropic/gpt-test", context_window: capacity }
+    ] }));
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => { server.closeAllConnections(); server.close(); });

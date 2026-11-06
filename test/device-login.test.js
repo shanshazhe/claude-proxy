@@ -95,6 +95,28 @@ test("ChatGPT device flow polls immediately, exchanges the code, and saves only 
   assert.doesNotMatch(JSON.stringify(done), /device-secret|authorization-secret|verifier-secret|refresh-secret/);
 });
 
+test("ChatGPT login completes while post-login synchronization is pending and stays successful if it fails", async () => {
+  let rejectSync;
+  const h = harness({
+    onCredentialsChanged: () => {
+      assert.equal(h.saved.length, 1, "credentials must be saved before synchronization starts");
+      return new Promise((_resolve, reject) => { rejectSync = reject; });
+    },
+    fetchImpl: async (url) => {
+      if (url.endsWith("/usercode")) return response({ device_auth_id: "d", user_code: "CODE", interval: 0 });
+      if (url.endsWith("/deviceauth/token")) return response({ authorization_code: "c", code_verifier: "v" });
+      return response({ access_token: makeJwt("account"), refresh_token: "r", expires_in: 3600 });
+    }
+  });
+  const started = await h.service.start("chatgpt");
+  assert.equal((await terminalSnapshot(h.service, started.id)).status, "complete");
+  assert.deepEqual(h.changed, ["openai-codex"]);
+  rejectSync(new Error("private-capacity-discovery-error"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.service.get(started.id).status, "complete");
+  assert.doesNotMatch(JSON.stringify(h.service.get(started.id)), /private-capacity/);
+});
+
 test("ChatGPT pending and slow_down responses honor the polling interval", async () => {
   let polls = 0;
   const delays = [];
