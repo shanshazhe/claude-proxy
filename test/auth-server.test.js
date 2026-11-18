@@ -380,7 +380,7 @@ test("HTTP setup rejects absent credentials, returns safe status and concurrentl
   let catalogs = 0;
   const { api, store } = await fixture(t, { env: {}, setupFactory: (store) => {
     configRoot = path.join(store.directory, "cli");
-    return createClaudeSetup({ configRoot, store, env: {}, probe: async () => ({ cli: true, bash: "/bin/bash", jq: "test-jq", node: process.execPath }),
+    return createClaudeSetup({ configRoot, store, env: {}, platform: "linux", probe: async () => ({ cli: true, bash: "/bin/bash", jq: "test-jq", node: process.execPath }),
       getAvailableModels: async () => { catalogs++; return { data: [{ id: "gpt-test" }] }; },
       installer: { validateBundle() {}, deploy: () => ({ command: "local-statusline" }), cleanup() {}, isConfigured: (value) => value?.command === "local-statusline" } });
   } });

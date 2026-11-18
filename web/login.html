@@ -127,11 +127,18 @@
       <button id="coding-discipline-install" type="button" disabled>Install Coding Discipline</button>
     </section>
 
-    <section class="card" aria-labelledby="statusline-heading">
+    <section id="statusline-card" class="card" aria-labelledby="statusline-heading" hidden>
       <h2 id="statusline-heading">Configure Statusline</h2>
-      <p>Replaces the current statusLine command, backing it up, and keeps unrelated plugins unchanged. Requires Claude CLI, Bash 3+, jq 1.6+, and Node.js 18+ (Git Bash on Windows); login is not required.</p>
+      <p>Replaces the current statusLine command, backing it up, and keeps unrelated plugins unchanged. Requires Claude CLI, Bash 3+, and jq 1.6+; login is not required.</p>
       <p id="statusline-status" class="status" role="status" aria-live="polite">Loading configuration status…</p>
       <button id="statusline-configure" type="button" disabled>Configure Statusline</button>
+    </section>
+
+    <section id="hud-card" class="card" aria-labelledby="hud-heading" hidden>
+      <h2 id="hud-heading">Claude HUD</h2>
+      <p>Install claude-hud using Claude CLI. After installation, run /reload-plugins and /hud in Claude Code to finish setup.</p>
+      <label class="toggle" for="hud-install"><input id="hud-install" type="checkbox" disabled> Install claude-hud</label>
+      <p id="hud-status" class="status" role="status" aria-live="polite">Checking Claude CLI…</p>
     </section>
 
     <section class="card" aria-labelledby="online-summary-heading">
@@ -213,7 +220,11 @@
         setMessage(document.getElementById("chatgpt-status"), chatgpt.configured ? "ChatGPT is configured." : "ChatGPT is not configured yet.", chatgpt.configured ? "success" : "");
       }
       renderSetupStatus("cli", status.claudeCli || {});
-      renderSetupStatus("statusline", status.statusline || {});
+      const hud = status.statusline?.kind === "claude-hud";
+      document.getElementById("hud-card").hidden = !hud;
+      document.getElementById("statusline-card").hidden = hud;
+      if (hud) renderHudStatus(status.statusline);
+      else renderSetupStatus("statusline", status.statusline || {});
       renderProjectMemory(status.projectMemory || {});
       renderCodingDiscipline(status.codingDiscipline || {});
       renderOnlineSummary(status.onlineSummary || {});
@@ -479,6 +490,30 @@
       } finally { macosPolling = false; }
     }
 
+    let hudBusy = false;
+    let hudMessage = null;
+    function renderHudStatus(status) {
+      const toggle = document.getElementById("hud-install");
+      toggle.disabled = hudBusy || !status.ready || status.installed === true;
+      if (hudBusy) return;
+      toggle.checked = status.installed === true;
+      setMessage(document.getElementById("hud-status"), hudMessage || status.reason ||
+        (status.installed ? "Claude HUD installed. Run /reload-plugins, then /hud in Claude Code." : "Check the box to install claude-hud."));
+    }
+    async function installHud() {
+      const toggle = document.getElementById("hud-install");
+      if (hudBusy || toggle.disabled || !toggle.checked) return;
+      hudBusy = true;
+      toggle.disabled = true;
+      setMessage(document.getElementById("hud-status"), "Installing claude-hud…");
+      try {
+        const result = await apiRequest("/api/auth/statusline/configure", { method: "POST", body: "{}", timeoutMs: 200000 });
+        if (result.success !== true) throw new Error("Claude HUD installation failed.");
+        hudMessage = result.message || "Claude HUD installed. Run /reload-plugins, then /hud in Claude Code.";
+      } catch (error) { hudMessage = error.message || "Claude HUD installation failed."; }
+      finally { hudBusy = false; await refreshStatus(); }
+    }
+
     let statusVersion = 0;
 
     function renderSetupStatus(name, setup) {
@@ -516,6 +551,8 @@
         setMessage(document.getElementById("macos-service-status"), "Unable to load macOS service status. Configuration is disabled.", "error");
         document.getElementById("project-memory-enabled").disabled = true;
         document.getElementById("coding-discipline-install").disabled = true;
+        document.getElementById("hud-install").disabled = true;
+        setMessage(document.getElementById("hud-status"), hudMessage || "Unable to check Claude CLI. Please retry.");
         document.getElementById("online-summary-enabled").disabled = true;
         document.getElementById("online-summary-model").disabled = true;
         document.getElementById("online-summary-threshold").disabled = true;
@@ -666,6 +703,7 @@
 
     document.getElementById("cli-configure").addEventListener("click", () => configureSetup("cli", "/api/auth/claude/configure"));
     document.getElementById("statusline-configure").addEventListener("click", () => configureSetup("statusline", "/api/auth/statusline/configure"));
+    document.getElementById("hud-install").addEventListener("change", installHud);
     document.getElementById("online-summary-enabled").addEventListener("change", () =>
       saveOnlineSummary({ enabled: document.getElementById("online-summary-enabled").checked }));
     document.getElementById("online-summary-model").addEventListener("change", () =>

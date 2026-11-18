@@ -28,6 +28,7 @@ for (const platform of ["mac", "windows"]) {
     let router;
     const serviceCalls = [];
     const memoryCalls = [];
+    const hudCalls = [];
     const upstream = [];
     const discoveryOptions = [];
     const invalidations = [];
@@ -88,7 +89,19 @@ for (const platform of ["mac", "windows"]) {
         }, { invalidate: () => invalidations.push(gptOnly) }) };
         if (name === "../lib/auth-server") return { createAuthRouter: (options) => { authOptions = options; router = auth.createAuthRouter(options); return router; } };
         if (name === "../lib/claude-setup") return { ...setup, getClaudeConfigRoot: () => configRoot,
-          createClaudeSetup: (options) => setup.createClaudeSetup({ ...options, env: {}, configRoot, probe: async () => ({ cli: true, bash: "/bin/bash", jq: "test-jq", node: process.execPath }) }) };
+          createClaudeSetup: (options) => setup.createClaudeSetup({ ...options, env: {}, configRoot,
+            platform: platform === "windows" ? "win32" : "darwin",
+            installer: nativeRequire("../lib/statusline-install").createStatuslineInstaller({ configRoot }),
+            probe: async () => ({ cli: true, ...(platform === "windows"
+              ? { claudeCommand: { file: "claude.exe", args: [] } }
+              : { bash: "/bin/bash", jq: "test-jq" }) }),
+            hudInstaller: { async install() {
+                hudCalls.push("install");
+                const latest = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
+                fs.writeFileSync(settingsFile, JSON.stringify({ ...latest, enabledPlugins: { ...latest.enabledPlugins, "claude-hud@claude-hud": true } }));
+                return { success: true, kind: "claude-hud", message: "Run /reload-plugins, then /hud." };
+              } }
+          }) };
         if (name === "../lib/online-summary") return { ...observations,
           createOnlineSummary: (options) => observations.createOnlineSummary({
             ...options, configFile: path.join(root, "features.json"), archiveRoot: path.join(root, "observations") }),
@@ -212,6 +225,8 @@ for (const platform of ["mac", "windows"]) {
     assert.deepEqual(fs.readFileSync(path.join(backups, fs.readdirSync(backups)[0])), original);
     const state = await (await fetch(base + "/api/auth/status", { headers })).json();
     assert.equal(state.statusline.ready, true);
+    assert.equal(state.statusline.kind, platform === "windows" ? "claude-hud" : "statusline");
+    assert.deepEqual(hudCalls, []);
     assert.equal(state.macosService.instance, undefined);
     const serviceResult = await fetch(base + "/api/auth/macos/service/configure", { method: "POST", headers, body: "{}" });
     assert.equal(serviceResult.status, 200);
@@ -222,6 +237,13 @@ for (const platform of ["mac", "windows"]) {
     assert.equal((await statusline.json()).success, true);
     const latest = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
     assert.deepEqual(latest.env, saved.env);
-    assert.notEqual(latest.statusLine.command, "existing");
+    if (platform === "windows") {
+      assert.equal(latest.statusLine.command, "existing");
+      assert.equal(latest.enabledPlugins["claude-hud@claude-hud"], true);
+      assert.deepEqual(hudCalls, ["install"]);
+    } else {
+      assert.notEqual(latest.statusLine.command, "existing");
+      assert.deepEqual(hudCalls, []);
+    }
   });
 }

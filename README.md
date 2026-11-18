@@ -281,9 +281,13 @@ After disabling, open a new terminal (or `unfunction claude` in the current one)
 
 ## Configuring Statusline
 
-**Configure Statusline** on `/login` is independent of ChatGPT / Copilot login and CLI routing. It requires a discoverable Claude CLI, **Bash 3+**, and **jq 1.6+**; Node.js is not needed by the statusline. On Windows, install Git Bash and jq manually. Missing dependencies are never downloaded automatically.
+The status-display card on `/login` follows the **proxy host's platform**, not the browser's platform. It is independent of ChatGPT / Copilot login and CLI routing. Both platform paths accept only an empty JSON object at `POST /api/auth/statusline/configure` under the local page's security guards.
 
-Clicking the button explicitly **replaces the existing `statusLine` command**, even if you already have one. The original settings bytes are backed up to the same private `settings-backups/` directory described above. Gateway environment variables, authentication, hooks, permissions, and unrelated plugins remain unchanged. The operation accepts only an empty JSON object at `POST /api/auth/statusline/configure` under the local page's security guards.
+**Windows — Claude HUD:** the page shows only the Claude HUD card. Once Claude CLI is detected, check **Install claude-hud** to install `claude-hud@claude-hud` from `jarrodwatts/claude-hud` using the official plugin commands and the actual `CLAUDE_CONFIG_DIR`. No additional dependency, settings, marketplace-source or installed-file checks are performed. Then run `/reload-plugins` and `/hud` in Claude Code to finish setup. Unchecking is not an uninstall action; the checkbox is disabled after a successful install during this proxy run. Installation errors leave it available to retry.
+
+**macOS / Linux — Configure Statusline:** keeps the bundled Bash/jq implementation described below. It requires a discoverable Claude CLI, **Bash 3+**, and **jq 1.6+**; Node.js is not needed by the statusline. Missing dependencies are never downloaded automatically.
+
+On these non-Windows platforms, clicking the button explicitly **replaces the existing `statusLine` command**, even if you already have one. The original settings bytes are backed up to the same private `settings-backups/` directory described above. Gateway environment variables, authentication, hooks, permissions, and unrelated plugins remain unchanged.
 
 The statusline is a single Bash/jq line: directory, git branch with a dirty marker, model name, current context usage (`ctx: used/total (pct%)`), whole-session `in/out/cache` tokens with the prompt-cache hit rate, and the cache state (`warm`, `cold`, or `dropped: <cause>`). `in` counts all input, including the cached system prompt. It is deployed into:
 
