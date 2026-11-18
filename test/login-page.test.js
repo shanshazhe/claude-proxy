@@ -9,7 +9,7 @@ function pageHarness(_unused, { status, configure, requestImpl, fastWait = false
   const elements = new Map();
   const element = (id) => {
     if (!elements.has(id)) elements.set(id, {
-      value: "", textContent: "", dataset: {}, hidden: true, disabled: ["cli-configure", "statusline-configure", "macos-service-configure", "project-memory-enabled", "coding-discipline-install"].includes(id), attributes: {}, listeners: {}, classList: { add() {}, remove() {} },
+      value: "", textContent: "", dataset: {}, hidden: true, disabled: ["cli-configure", "statusline-configure", "hud-install", "macos-service-configure", "project-memory-enabled", "coding-discipline-install"].includes(id), attributes: {}, listeners: {}, classList: { add() {}, remove() {} },
       setAttribute(name, value) { this.attributes[name] = value; },
       addEventListener(name, handler) { this.listeners[name] = handler; },
       replaceChildren(...children) { this.children = children; }
@@ -314,6 +314,46 @@ test("credentials gate CLI, authorization updates readiness, and status failure 
   fail = true;
   await page.refresh();
   assert.equal(page.element("cli-configure").disabled, true);
+});
+
+test("Windows shows only the HUD card and checking its box installs once", async () => {
+  let installed = false;
+  let finish;
+  const page = pageHarness(null, { status: () => ({ statusline: { kind: "claude-hud", ready: true, installed } }),
+    configure: () => new Promise((resolve) => { finish = () => { installed = true; resolve(response({ success: true })); }; }) });
+  await page.refresh();
+  assert.equal(page.element("hud-card").hidden, false);
+  assert.equal(page.element("statusline-card").hidden, true);
+  const toggle = page.element("hud-install");
+  assert.equal(toggle.disabled, false);
+  assert.equal(toggle.checked, false);
+  toggle.checked = true;
+  const installing = toggle.listeners.change();
+  await toggle.listeners.change();
+  assert.equal(toggle.disabled, true);
+  assert.equal(page.requests.filter((r) => r.options.method === "POST").length, 1);
+  finish(); await installing;
+  assert.equal(toggle.checked, true);
+  assert.equal(toggle.disabled, true);
+  assert.match(page.element("hud-status").textContent, /\/reload-plugins.*\/hud/);
+  const html = fs.readFileSync(path.join(__dirname, "../web/login.html"), "utf8");
+  const card = html.match(/<section id="hud-card"[\s\S]*?<\/section>/)[0];
+  assert.doesNotMatch(card, /Bash|jq|ccusage|ccstatusline|Node\.js|Replaces|Configure Statusline/);
+});
+
+test("HUD missing CLI disables its checkbox and install failures allow retry", async () => {
+  let ready = false;
+  const page = pageHarness(null, { status: () => ({ statusline: { kind: "claude-hud", ready, reason: ready ? "" : "Install Claude CLI first." } }),
+    configure: async () => response({ error: "Claude HUD installation failed." }, 503) });
+  await page.refresh();
+  const toggle = page.element("hud-install");
+  assert.equal(toggle.disabled, true);
+  ready = true; await page.refresh();
+  assert.equal(toggle.disabled, false);
+  toggle.checked = true; await toggle.listeners.change();
+  assert.equal(toggle.checked, false);
+  assert.equal(toggle.disabled, false);
+  assert.equal(page.element("hud-status").textContent, "Claude HUD installation failed.");
 });
 
 test("parallel setup buttons keep independent busy, success and fixed backend errors", async () => {

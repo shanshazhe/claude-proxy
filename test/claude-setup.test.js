@@ -14,7 +14,7 @@ function fixture(t, options = {}) {
   const store = { readAuth: () => state.auth };
   const installer = { validateBundle() {}, deploy() { state.deployed++; return { command: "test-statusline-command", created: true }; },
     cleanup() { state.cleaned++; }, isConfigured: (statusLine) => statusLine?.command === "test-statusline-command" };
-  const base = { configRoot: root, env: {}, store, installer,
+  const base = { configRoot: root, env: {}, store, installer, platform: "darwin",
     probe: async () => { state.probes++; return { cli: true, bash: "/bin/bash", jq: "/bin/jq", node: process.execPath }; },
     getAvailableModels: async () => { state.catalogs++; return { data: [{ id: "gpt-test" }] }; } };
   const setup = createClaudeSetup({ ...base, ...options });
@@ -652,7 +652,9 @@ test("custom actual config root and statusline leave routing untouched", async (
 
 test("real bundled statusline setup is independent, idempotent and preserves reused deployments on save failure", async (t) => {
   const f = fixture(t);
-  const setup = createClaudeSetup({ ...f.base, installer: undefined });
+  // 在 Windows 测试机上仍使用能转换本机路径的 launcher，后端分支显式固定为非 Windows。
+  const installer = require("../lib/statusline-install").createStatuslineInstaller({ configRoot: f.root });
+  const setup = createClaudeSetup({ ...f.base, installer });
   f.state.auth = {};
   await setup.configureStatusline();
   const first = f.read();
@@ -663,7 +665,7 @@ test("real bundled statusline setup is independent, idempotent and preserves reu
   const root = path.join(f.root, "claude-proxy", "statusline");
   assert.equal(fs.readdirSync(root).length, 1);
   f.write({ statusLine: { type: "command", command: "other-personal-script" } });
-  const failing = createClaudeSetup({ ...f.base, installer: undefined, fsImpl: { ...fs, renameSync() { throw new Error("save failure"); } } });
+  const failing = createClaudeSetup({ ...f.base, installer, fsImpl: { ...fs, renameSync() { throw new Error("save failure"); } } });
   await assert.rejects(failing.configureStatusline(), /Existing settings were kept/);
   assert.equal(fs.readdirSync(root).length, 1);
   assert.equal(f.read().statusLine.command, "other-personal-script");
@@ -710,6 +712,45 @@ test("version probes reject old Bash/jq/Node without shell or automatic installa
     const deps = await probe();
     assert.deepEqual([Boolean(deps.bash), Boolean(deps.jq), Boolean(deps.node)], expected);
   }
+});
+
+test("Windows HUD only requires Claude CLI, independent of settings and other dependencies", async (t) => {
+  const f = fixture(t);
+  f.state.auth = {};
+  f.write("damaged settings must be left to Claude CLI");
+  let installs = 0;
+  const setup = createClaudeSetup({ ...f.base, platform: "win32",
+    probe: async () => ({ cli: true, claudeCommand: { file: "claude.exe", args: [] } }),
+    hudInstaller: { async install() { installs++; return { success: true }; } } });
+  assert.equal((await setup.getStatus()).statusline.ready, true);
+  assert.equal(installs, 0);
+  assert.equal((await setup.configureStatusline()).success, true);
+  assert.equal((await setup.getStatus()).statusline.installed, true);
+  assert.equal(installs, 1);
+  assert.deepEqual(fs.readdirSync(f.root), ["settings.json"]);
+  assert.equal(fs.readFileSync(f.settingsFile, "utf8"), "damaged settings must be left to Claude CLI");
+});
+
+test("Windows HUD is disabled only when Claude CLI is missing", async (t) => {
+  const f = fixture(t);
+  const setup = createClaudeSetup({ ...f.base, platform: "win32", probe: async () => ({ cli: false }),
+    hudInstaller: { install() { assert.fail("must not install"); } } });
+  const status = (await setup.getStatus()).statusline;
+  assert.equal(status.ready, false);
+  assert.equal(status.kind, "claude-hud");
+  assert.match(status.reason, /Claude CLI/);
+  await assert.rejects(setup.configureStatusline(), { setupCode: "cli" });
+});
+
+test("CLI-only Windows probe does not run Bash, jq or Node version checks", async () => {
+  const deps = await createSetupProbe({ platform: "win32", env: { PATH: "C:\\tools" }, home: "C:\\home",
+    cliOnly: true, includeClaudeCommand: true, fsImpl: { statSync: () => ({ isFile: () => true }) },
+    execFileImpl(file, args, options, done) {
+      assert.ok(file.endsWith("claude.exe"));
+      done(null, "2.1.327 (Claude Code)");
+    } })();
+  assert.equal(deps.cli, true);
+  assert.deepEqual(deps.claudeCommand, { file: "C:\\tools\\claude.exe", args: [] });
 });
 
 test("missing CLI/dependencies and invalid bundles gate statusline without deploying", async (t) => {
