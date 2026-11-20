@@ -288,7 +288,7 @@ test("Codex catalog honors visibility and API support filters", async () => {
     loadClaudeAuth: async () => { throw new Error("No Copilot credentials"); },
     loadAuth: async () => ({ kind: "codex", token: "codex-test", accountId: "account-test" }),
     fetchImpl: async (url, options) => {
-      assert.ok(url.includes("/codex/models?client_version="));
+      assert.equal(url, `https://chatgpt.com/backend-api/codex/models?client_version=${encodeURIComponent(process.env.CODEX_CLIENT_VERSION || "0.171.0")}`);
       assert.equal(options.headers["chatgpt-account-id"], "account-test");
       return ok({ models: [
         { slug: "gpt-5.4", visibility: "list" },
