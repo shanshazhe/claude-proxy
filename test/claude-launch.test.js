@@ -11,10 +11,10 @@ const main = (options) => launchMain({ store: signedInStore, ...options });
 const { createSetupProbe } = require("../lib/claude-probes");
 
 const catalog = { data: [
-  { id: "anthropic/gpt-6.1-sol", context_window: 872000 },
-  { id: "anthropic/gpt-small", context_window: 400000 },
-  { id: "claude-opus-4.8", context_window: 1000000 },
-  { id: "claude-haiku-4.5", context_window: 200000 }
+  { id: "anthropic/gpt-6.1-sol", owned_by: "openai", api: "openai-responses", context_window: 872000 },
+  { id: "anthropic/gpt-small", owned_by: "openai", api: "openai-responses", context_window: 400000 },
+  { id: "claude-opus-4.8", owned_by: "github-copilot", api: "anthropic-messages", context_window: 1000000 },
+  { id: "claude-haiku-4.5", owned_by: "github-copilot", api: "anthropic-messages", context_window: 200000 }
 ] };
 
 test("ordinary settings-selected launches use the largest valid GPT window without selecting a model", () => {
@@ -25,21 +25,21 @@ test("ordinary settings-selected launches use the largest valid GPT window witho
   assert.deepEqual(launch.env, { KEEP: "yes", CLAUDE_CODE_MAX_CONTEXT_TOKENS: "872000" });
   assert.deepEqual(env, { KEEP: "yes" });
   assert.equal(buildLaunch(catalog, [], { CLAUDE_CODE_MAX_CONTEXT_TOKENS: "123456" }).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "123456");
-  const mixed = { data: [...catalog.data, { id: "gpt-invalid", context_window: "100" }] };
+  const mixed = { data: [...catalog.data, { id: "gpt-invalid", owned_by: "openai", api: "openai-responses", context_window: "100" }] };
   assert.equal(buildLaunch(mixed, [], {}).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "872000");
-  for (const data of [[{ id: "gpt-invalid" }], [{ id: "claude-opus-4.8", context_window: 1000000 }]]) {
+  for (const data of [[{ id: "gpt-invalid", owned_by: "openai", api: "openai-responses" }], [{ id: "claude-opus-4.8", owned_by: "github-copilot", api: "anthropic-messages", context_window: 1000000 }]]) {
     assert.deepEqual(buildLaunch({ data }, [], {}).env, {});
   }
 });
 
 test("ordinary launches scan every GPT model for the largest valid capacity regardless of order", () => {
   const data = [
-    { id: "gpt-small", context_window: 400000 },
-    { id: "gpt-invalid", context_window: Number.MAX_SAFE_INTEGER + 1 },
-    { id: "anthropic/gpt-largest", context_window: 600000, max_context_window: 1200000 },
-    { id: "claude-test", context_window: 2000000 },
+    { id: "gpt-small", owned_by: "openai", api: "openai-responses", context_window: 400000 },
+    { id: "gpt-invalid", owned_by: "openai", api: "openai-responses", context_window: Number.MAX_SAFE_INTEGER + 1 },
+    { id: "anthropic/gpt-largest", owned_by: "openai", api: "openai-responses", context_window: 600000, max_context_window: 1200000 },
+    { id: "claude-test", owned_by: "github-copilot", api: "anthropic-messages", context_window: 2000000 },
     { id: "qwen/test", context_window: 4000000 },
-    { id: "gpt-medium", runtime: { max_input_tokens: 872000 } }
+    { id: "gpt-medium", owned_by: "openai", api: "openai-responses", runtime: { max_input_tokens: 872000 } }
   ];
   for (const models of [data, [...data].reverse()]) {
     const launch = buildLaunch({ data: models }, [], {});
@@ -82,14 +82,14 @@ test("explicit non-GPT selections win over the environment without rewriting ali
 test("only GPT metadata determines capacity even if the server returns mixed providers", () => {
   const mixed = { data: [...catalog.data, { id: "qwen/test", context_window: 32000 }] };
   assert.equal(buildLaunch(mixed, [], {}).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "872000");
-  for (const data of [[{ id: "qwen/test", context_window: 32000 }], [{ id: "gpt-no-limit", max_context_window: 872000 }]]) {
+  for (const data of [[{ id: "qwen/test", context_window: 32000 }], [{ id: "gpt-no-limit", owned_by: "openai", api: "openai-responses", max_context_window: 872000 }]]) {
     assert.equal(buildLaunch({ data }, [], {}).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, data[0].id.startsWith("gpt-") ? "872000" : undefined);
   }
 });
 
 test("unknown models, caller limits and the prompt after -- remain untouched", () => {
   const args = ["--model", "opus", "--", "--settings", "prompt", "--model=gpt-small"];
-  const launch = buildLaunch({ data: [{ id: "anthropic/gpt-new" }] }, args, { KEEP: "1" });
+  const launch = buildLaunch({ data: [{ id: "anthropic/gpt-new", owned_by: "openai", api: "openai-responses" }] }, args, { KEEP: "1" });
   assert.deepEqual(launch.args, args);
   assert.deepEqual(launch.env, { KEEP: "1" });
   const selected = buildLaunch(catalog, ["--", "prompt"], { ANTHROPIC_MODEL: "gpt-small", CLAUDE_CODE_MAX_CONTEXT_TOKENS: "300000" });
@@ -100,7 +100,7 @@ test("unknown models, caller limits and the prompt after -- remain untouched", (
 test("all non-model flags pass through without parsing, reading or injecting settings", async () => {
   const args = ["--settings", "file that does not exist.json", "--setting-sources=project", "--bare", "-p", "hello"];
   const env = { ANTHROPIC_BASE_URL: "http://environment", KEEP: "yes" };
-  const unknownCatalog = { data: [{ id: "gpt-unknown" }] };
+  const unknownCatalog = { data: [{ id: "gpt-unknown", owned_by: "openai", api: "openai-responses" }] };
   assert.deepEqual(buildLaunch(unknownCatalog, args, env).args, args);
   assert.equal(await main({ args, env,
     fetchImpl: async (url) => {
@@ -136,7 +136,7 @@ test("session startup allows 15 seconds and adopts a catalog arriving after 3 se
         setTimeout(resolve, 5000);
         signal.addEventListener("abort", () => reject(signal.reason), { once: true });
       });
-      return { ok: true, json: async () => ({ data: [{ id: "gpt-test", context_window: 872000 }] }) };
+      return { ok: true, json: async () => ({ data: [{ id: "gpt-test", owned_by: "openai", api: "openai-responses", context_window: 872000 }] }) };
     },
     probe: async () => ({ claudeCommand: { file: "cli", args: [] } }),
     spawnImpl: (file, args, options) => {
@@ -258,8 +258,8 @@ test("successive launches pass the largest changing GPT capacity to real child p
     fetched++;
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ data: [
-      { id: "gpt-small", context_window: 400000 },
-      { id: "anthropic/gpt-test", context_window: capacity }
+      { id: "gpt-small", owned_by: "openai", api: "openai-responses", context_window: 400000 },
+      { id: "anthropic/gpt-test", owned_by: "openai", api: "openai-responses", context_window: capacity }
     ] }));
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -399,7 +399,7 @@ test("native and npm probes return shell-free launch commands", async () => {
 
 test("unknown or invalid selected GPT capacity never borrows another model's limit", () => {
   for (const capacity of [undefined, null, 0, -1, 1.5, "400000", Number.MAX_SAFE_INTEGER + 1]) {
-    const models = { data: [{ id: "gpt-small", context_window: capacity }, { id: "gpt-large", context_window: 1000000 }] };
+    const models = { data: [{ id: "gpt-small", owned_by: "openai", api: "openai-responses", context_window: capacity }, { id: "gpt-large", owned_by: "openai", api: "openai-responses", context_window: 1000000 }] };
     for (const [args, env] of [[["--model", "gpt-small"], {}], [[], { ANTHROPIC_MODEL: "gpt-small" }]]) {
       const launch = buildLaunch(models, args, env);
       assert.equal(launch.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, undefined);
@@ -411,7 +411,7 @@ test("unknown or invalid selected GPT capacity never borrows another model's lim
 });
 
 test("an explicit Claude selection without valid capacity does not borrow the shared GPT limit", () => {
-  const models = { data: [{ id: "claude-test" }, { id: "gpt-test", context_window: 500000 }] };
+  const models = { data: [{ id: "claude-test", owned_by: "github-copilot", api: "anthropic-messages" }, { id: "gpt-test", owned_by: "openai", api: "openai-responses", context_window: 500000 }] };
   for (const [args, env] of [[["--model", "claude-test"], {}], [[], { ANTHROPIC_MODEL: "claude-test" }]]) {
     assert.equal(buildLaunch(models, args, env).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, undefined);
   }

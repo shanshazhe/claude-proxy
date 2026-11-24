@@ -18,7 +18,7 @@ for (const kind of ["api", "codex"]) {
       fetchImpl: async (url) => {
         calls++;
         assert.ok(url.includes(kind === "codex" ? "/backend-api/codex/models?" : "/models"));
-        const model = { id: "gpt-test", slug: "gpt-test", context_window: 872000 };
+        const model = { id: "gpt-test", owned_by: "openai", api: "openai-responses", slug: "gpt-test", context_window: 872000 };
         return ok(kind === "codex" ? { models: [model] } : { data: [model] });
       }
     });
@@ -42,7 +42,7 @@ test("GPT-only discovery does not reuse a failed full catalog's empty cache", as
     fetchImpl: async () => {
       calls++;
       if (fail) throw new Error("offline");
-      return ok({ data: [{ id: "gpt-test", context_window: 872000 }] });
+      return ok({ data: [{ id: "gpt-test", owned_by: "openai", api: "openai-responses", context_window: 872000 }] });
     }
   };
   const full = createModelDiscovery(options);
@@ -88,7 +88,7 @@ for (const options of [undefined, { waitForRefresh: false }]) {
       fetchImpl: async () => {
         calls++;
         await new Promise((resolve) => setTimeout(resolve, 5000));
-        return ok({ data: [{ id: "gpt-5.4" }] });
+        return ok({ data: [{ id: "gpt-5.4", owned_by: "openai", api: "openai-responses" }] });
       }
     });
     let result;
@@ -119,7 +119,7 @@ test("waitForRefresh waits beyond the reply deadline and coalesces mixed callers
       calls++;
       await new Promise((resolve) => setTimeout(resolve, 5000));
       return ok({ data: url.includes("githubcopilot.com")
-        ? [{ id: "claude-sonnet-4", model_picker_enabled: true }] : [{ id: "gpt-5.4" }] });
+        ? [{ id: "claude-sonnet-4", supported_endpoints: ["/v1/messages"], owned_by: "github-copilot", api: "anthropic-messages", model_picker_enabled: true }] : [{ id: "gpt-5.4", owned_by: "openai", api: "openai-responses" }] });
     }
   });
   let refreshed;
@@ -156,7 +156,7 @@ test("default discovery returns stale cache while waitForRefresh awaits its refr
     fetchImpl: async () => {
       const index = ++calls;
       if (index > 1) await new Promise((resolve) => setTimeout(resolve, 5000));
-      return ok({ data: [{ id: `gpt-${index}.4` }] });
+      return ok({ data: [{ id: `gpt-${index}.4`, supported_endpoints: ["/responses"] }] });
     }
   });
   const initial = await getModels({ waitForRefresh: true });
@@ -190,7 +190,7 @@ for (const allUnavailable of [false, true]) {
       loadClaudeAuth: async () => ({ token: "fixture", baseUrl: "https://api.business.githubcopilot.com" }),
       fetchImpl: async (url, { signal }) => {
         signals.push(signal);
-        if (!allUnavailable && !url.includes("githubcopilot.com")) return ok({ data: [{ id: "gpt-5.4" }] });
+        if (!allUnavailable && !url.includes("githubcopilot.com")) return ok({ data: [{ id: "gpt-5.4", owned_by: "openai", api: "openai-responses" }] });
         return new Promise(() => {}); // Ignore abort to exercise the discovery deadline itself.
       }
     });
@@ -228,7 +228,7 @@ test("invalidation refreshes immediately and an older pending catalog cannot res
     fetchImpl: async () => {
       const index = ++calls;
       if (index === 1) await new Promise((resolve) => { release = resolve; });
-      return ok({ data: [{ id: `gpt-${index}.4` }] });
+      return ok({ data: [{ id: `gpt-${index}.4`, supported_endpoints: ["/responses"] }] });
     }
   });
   const old = getModels();
@@ -261,13 +261,13 @@ test("OpenAI Responses and Copilot Claude catalogs merge, coalesce, and cache", 
       if (url.includes("githubcopilot.com")) {
         assert.equal(options.headers.Authorization, "Bearer copilot-test");
         return ok({ data: [
-          { id: "claude-sonnet-4", model_picker_enabled: true },
-          { id: "gpt-5.4", model_picker_enabled: true }
+          { id: "claude-sonnet-4", supported_endpoints: ["/v1/messages"], owned_by: "github-copilot", api: "anthropic-messages", model_picker_enabled: true },
+          { id: "gpt-5.4", owned_by: "openai", api: "openai-responses", model_picker_enabled: true }
         ] });
       }
       assert.equal(url, "https://api.openai.com/v1/models");
       assert.equal(options.headers.Authorization, "Bearer openai-test");
-      return ok({ data: [{ id: "gpt-5.4" }, { id: "gpt-5.4-realtime" }, { id: "text-embedding-3-large" }] });
+      return ok({ data: [{ id: "gpt-5.4", owned_by: "openai", api: "openai-responses" }, { id: "gpt-5.4-realtime", owned_by: "openai", api: "openai-responses" }, { id: "text-embedding-3-large" }] });
     }
   });
   const [first, joined] = await Promise.all([getModels(), getModels()]);
@@ -305,11 +305,11 @@ test("API discovery selects the largest valid declared limit, including max-only
     loadClaudeAuth: async () => { throw new Error("no Copilot fixture"); },
     loadAuth: async () => ({ kind: "api", token: "fixture" }),
     fetchImpl: async () => ok({ data: [
-      { id: "gpt-test-1", max_context_window: 872000 },
-      { id: "gpt-test-2", context_window: 0, max_context_window: 872000 },
-      { id: "gpt-test-3", context_window: 872000, max_context_window: 500000 },
-      { id: "gpt-test-4", context_window: 500000, runtime: { max_input_tokens: 872000 } },
-      { id: "gpt-test-5", context_window: 500000, capabilities: { limits: { max_context_window_tokens: 872000 } } }
+      { id: "gpt-test-1", owned_by: "openai", api: "openai-responses", max_context_window: 872000 },
+      { id: "gpt-test-2", owned_by: "openai", api: "openai-responses", context_window: 0, max_context_window: 872000 },
+      { id: "gpt-test-3", owned_by: "openai", api: "openai-responses", context_window: 872000, max_context_window: 500000 },
+      { id: "gpt-test-4", owned_by: "openai", api: "openai-responses", context_window: 500000, runtime: { max_input_tokens: 872000 } },
+      { id: "gpt-test-5", owned_by: "openai", api: "openai-responses", context_window: 500000, capabilities: { limits: { max_context_window_tokens: 872000 } } }
     ] })
   });
   for (const model of (await getModels()).data) {
@@ -323,7 +323,7 @@ test("a source that has never answered is omitted while the other source works",
   const getModels = createModelDiscovery({
     loadClaudeAuth: async () => { throw new Error("No Copilot credentials"); },
     loadAuth: async () => ({ kind: "api", token: "test" }),
-    fetchImpl: async () => ok({ data: [{ id: "gpt-5.4" }] })
+    fetchImpl: async () => ok({ data: [{ id: "gpt-5.4", owned_by: "openai", api: "openai-responses" }] })
   });
   assert.deepEqual((await getModels()).data.map((model) => model.id), ["gpt-5.4"]);
 });
@@ -338,15 +338,30 @@ test("Claude catalog failures preserve only the stale Claude source", async () =
     fetchImpl: async (url) => {
       if (url.includes("githubcopilot.com")) {
         if (failCopilot) throw new Error("Copilot offline");
-        return ok({ data: [{ id: "claude-sonnet-4", model_picker_enabled: true }] });
+        return ok({ data: [{ id: "claude-sonnet-4", supported_endpoints: ["/v1/messages"], owned_by: "github-copilot", api: "anthropic-messages", model_picker_enabled: true }] });
       }
-      return ok({ data: [{ id: "gpt-5.4" }] });
+      return ok({ data: [{ id: "gpt-5.4", owned_by: "openai", api: "openai-responses" }] });
     }
   });
   const initial = await getModels();
   clock = 300001;
   failCopilot = true;
   assert.deepEqual((await getModels()).data, initial.data);
+});
+
+test("OpenAI catalog preserves ID-only GPT deployments without using capacity as transport metadata", async () => {
+  const getModels = createModelDiscovery({ gptOnly: true, loadAuth: async () => ({ kind: "api", token: "fixture" }),
+    fetchImpl: async () => ok({ data: [
+      { id: "gpt-new-deployment" },
+      { id: "embedding-with-window", context_window: 4096 },
+      { id: "gpt-realtime-new", context_window: 4096 },
+      { id: "gpt-explicitly-not-responses", supported_endpoints: ["/chat/completions"], context_window: 4096 },
+      { id: "custom-chat", supported_endpoints: ["/responses"] }
+    ] }) });
+  const models = (await getModels({ waitForRefresh: true })).data;
+  assert.deepEqual(models.map(({ id, api }) => [id, api]), [
+    ["gpt-new-deployment", "openai-responses"], ["custom-chat", "openai-responses"]
+  ]);
 });
 
 test("Codex discovery defaults to the largest declared context and preserves output limits", async () => {

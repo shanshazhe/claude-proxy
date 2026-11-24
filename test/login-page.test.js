@@ -316,11 +316,13 @@ test("credentials gate CLI, authorization updates readiness, and status failure 
   assert.equal(page.element("cli-configure").disabled, true);
 });
 
-test("Windows shows only the HUD card and checking its box installs once", async () => {
-  let installed = false;
+test("Windows HUD checkbox stays editable when enabled and prevents duplicate changes", async () => {
+  let enabled = false;
   let finish;
-  const page = pageHarness(null, { status: () => ({ statusline: { kind: "claude-hud", ready: true, installed } }),
-    configure: () => new Promise((resolve) => { finish = () => { installed = true; resolve(response({ success: true })); }; }) });
+  const page = pageHarness(null, { status: () => ({ statusline: { kind: "claude-hud", ready: true, installed: true, enabled } }),
+    configure: (_url, options) => new Promise((resolve) => { finish = () => {
+      enabled = JSON.parse(options.body).enabled; resolve(response({ success: true, enabled }));
+    }; }) });
   await page.refresh();
   assert.equal(page.element("hud-card").hidden, false);
   assert.equal(page.element("statusline-card").hidden, true);
@@ -334,8 +336,15 @@ test("Windows shows only the HUD card and checking its box installs once", async
   assert.equal(page.requests.filter((r) => r.options.method === "POST").length, 1);
   finish(); await installing;
   assert.equal(toggle.checked, true);
-  assert.equal(toggle.disabled, true);
+  assert.equal(toggle.disabled, false);
   assert.match(page.element("hud-status").textContent, /\/reload-plugins.*\/hud/);
+  toggle.checked = false;
+  const disabling = toggle.listeners.change();
+  assert.equal(toggle.disabled, true);
+  finish(); await disabling;
+  assert.equal(toggle.checked, false);
+  assert.equal(toggle.disabled, false);
+  assert.match(page.element("hud-status").textContent, /off.*files are kept/);
   const html = fs.readFileSync(path.join(__dirname, "../web/login.html"), "utf8");
   const card = html.match(/<section id="hud-card"[\s\S]*?<\/section>/)[0];
   assert.doesNotMatch(card, /Bash|jq|ccusage|ccstatusline|Node\.js|Replaces|Configure Statusline/);
@@ -354,6 +363,20 @@ test("HUD missing CLI disables its checkbox and install failures allow retry", a
   assert.equal(toggle.checked, false);
   assert.equal(toggle.disabled, false);
   assert.equal(page.element("hud-status").textContent, "Claude HUD installation failed.");
+});
+
+test("HUD disable failure restores the last enabled state", async () => {
+  const page = pageHarness(null, { status: () => ({ statusline: { kind: "claude-hud", ready: true, installed: true, enabled: true } }),
+    configure: async () => response({ error: "Disable failed." }, 503) });
+  await page.refresh();
+  const toggle = page.element("hud-install");
+  assert.equal(toggle.checked, true);
+  assert.equal(toggle.disabled, false);
+  toggle.checked = false;
+  await toggle.listeners.change();
+  assert.equal(toggle.checked, true);
+  assert.equal(toggle.disabled, false);
+  assert.equal(page.element("hud-status").textContent, "Disable failed.");
 });
 
 test("parallel setup buttons keep independent busy, success and fixed backend errors", async () => {

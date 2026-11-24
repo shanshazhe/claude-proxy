@@ -1,12 +1,13 @@
 const http = require("http");
-const { estimateInputTokens } = require("../lib/token-count");
+const { countTokens, getModelCapabilities } = require("../lib/pi-capabilities");
+const { resolveGatewayModel } = require("../lib/pi-registry");
+const { isReplayCarrier } = require("../lib/responses-replay");
 const fs = require("fs");
 const path = require("path");
 
-const { isResponsesModel, getPromptCacheKey, getResponsesReasoning, requestResponses } = require("../lib/openai-responses");
+const { requestPiModel } = require("../lib/pi-model");
 const { selectModel, toGatewayModelId, toGatewayModels } = require("../lib/model-routing");
 const { createModelDiscovery } = require("../lib/model-discovery");
-const { isClaudeModel, forwardClaudeRequest } = require("../lib/github-copilot");
 const { parseWebSearchRequest, runWebSearch, toAnthropicMessage, toAnthropicEvents } = require("../lib/web-search");
 const { createOnlineSummary, createSummarySettings } = require("../lib/online-summary");
 const { createSummaryModel, DEFAULT_PROMPT: DEFAULT_SUMMARY_PROMPT } = require("../lib/summary-model");
@@ -47,7 +48,6 @@ const projectMemoryMaintainer = createProjectMemoryMaintainer({
   onEvent: (details) => logEvent("project-memory", "Project memory updated", details),
   onWarning: (details) => logWarn("project-memory", "Project memory update failed", details)
 });
-const IMAGE_UNCONVERTIBLE_TEXT = "[image omitted: invalid or unsupported image source]";
 
 let requestCounter = 0;
 
@@ -155,6 +155,14 @@ function sendJsonError(res, status, message) {
   );
 }
 
+function sendUpstreamError(res, error) {
+  const status = error.status || 502;
+  res.writeHead(status, { ...error.responseHeaders, "Content-Type": "application/json" });
+  res.end(JSON.stringify(error.body || {
+    type: "error", error: { type: getErrorType(status), message: error.message }
+  }));
+}
+
 function sendStreamError(res, status, message) {
   if (res.destroyed || res.writableEnded) {
     return;
@@ -176,253 +184,6 @@ function sendStreamError(res, status, message) {
     );
     res.end();
   }
-}
-
-function convertAnthropicImageToOpenAI(block) {
-  const source = block && block.source ? block.source : {};
-  if (source.type === "base64" && typeof source.data === "string") {
-    const mediaType = source.media_type || "image/png";
-    return {
-      type: "image_url",
-      image_url: { url: `data:${mediaType};base64,${source.data}` }
-    };
-  }
-  if (source.type === "url" && typeof source.url === "string") {
-    return { type: "image_url", image_url: { url: source.url } };
-  }
-  return null;
-}
-
-// Convert Anthropic messages format to OpenAI format
-function convertAnthropicToOpenAI(anthropicBody, requestId) {
-  const messages = [];
-  let droppedImages = 0;
-  let forwardedImages = 0;
-
-  // Add system message if present
-  if (anthropicBody.system) {
-    if (typeof anthropicBody.system === "string") {
-      messages.push({ role: "system", content: anthropicBody.system });
-    } else if (Array.isArray(anthropicBody.system)) {
-      const text = anthropicBody.system.map((b) => b.text || "").join("\n");
-      messages.push({ role: "system", content: text });
-    }
-  }
-
-  // Convert messages
-  for (const msg of anthropicBody.messages || []) {
-    if (typeof msg.content === "string") {
-      messages.push({ role: msg.role, content: msg.content });
-      continue;
-    }
-
-    if (!Array.isArray(msg.content)) {
-      continue;
-    }
-
-    const parts = [];
-    const contentParts = [];
-    let hasOpenAIImagePart = false;
-    const toolCalls = [];
-    const toolResults = [];
-    const toolResultImageParts = [];
-
-    const addTextPart = (text) => {
-      if (!text) {
-        return;
-      }
-      parts.push(text);
-      contentParts.push({ type: "text", text: text });
-    };
-
-    for (const block of msg.content) {
-      if (block.type === "text") {
-        addTextPart(block.text);
-      } else if (block.type === "tool_use") {
-        toolCalls.push({
-          id: block.id,
-          type: "function",
-          function: {
-            name: block.name,
-            arguments: JSON.stringify(block.input)
-          }
-        });
-      } else if (block.type === "tool_result") {
-        let content = "";
-        if (typeof block.content === "string") {
-          content = block.content;
-        } else if (Array.isArray(block.content)) {
-          content = block.content
-            .map((c) => {
-              if (c && c.type === "image") {
-                // OpenAI-compatible tool messages cannot contain image_url
-                // parts. Preserve the tool result and attach its images in a
-                // following user message, which the configured model can read.
-                const imagePart = convertAnthropicImageToOpenAI(c);
-                if (imagePart) {
-                  toolResultImageParts.push(imagePart);
-                  forwardedImages += 1;
-                  return "";
-                }
-                droppedImages += 1;
-                return IMAGE_UNCONVERTIBLE_TEXT;
-              }
-              return c.text || JSON.stringify(c);
-            })
-            .filter(Boolean)
-            .join("\n");
-        } else if (block.content) {
-          content = JSON.stringify(block.content);
-        }
-        toolResults.push({
-          role: "tool",
-          tool_call_id: block.tool_use_id,
-          content: content || "[Image result forwarded in the following user message.]"
-        });
-      } else if (block.type === "image") {
-        const imagePart = convertAnthropicImageToOpenAI(block);
-        if (imagePart) {
-          contentParts.push(imagePart);
-          hasOpenAIImagePart = true;
-          forwardedImages += 1;
-        } else {
-          addTextPart(IMAGE_UNCONVERTIBLE_TEXT);
-          droppedImages += 1;
-        }
-      }
-    }
-
-    if (toolCalls.length > 0) {
-      messages.push({
-        role: "assistant",
-        content: parts.length > 0 ? parts.join("\n") : null,
-        tool_calls: toolCalls
-      });
-    }
-    // Tool outputs must directly follow the assistant's tool calls; text sent with
-    // them (interruptions, follow-up prompts) comes after.
-    for (const tr of toolResults) {
-      messages.push(tr);
-    }
-    if (toolResultImageParts.length > 0) {
-      messages.push({
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: "Analyze the image result(s) from the preceding tool call(s) using the current conversation context."
-          },
-          ...toolResultImageParts
-        ]
-      });
-    }
-    if (toolCalls.length === 0) {
-      if (hasOpenAIImagePart) {
-        messages.push({ role: msg.role, content: contentParts });
-      } else if (parts.length > 0) {
-        messages.push({ role: msg.role, content: parts.join("\n") });
-      }
-    }
-  }
-
-  const openaiBody = {
-    model: anthropicBody.model,
-    messages: messages,
-    max_tokens: anthropicBody.max_tokens || 4096,
-    stream: true
-  };
-
-  if (anthropicBody.temperature !== undefined) {
-    openaiBody.temperature = anthropicBody.temperature;
-  }
-
-  // Convert tools if present
-  if (anthropicBody.tools && anthropicBody.tools.length > 0) {
-    openaiBody.tools = anthropicBody.tools.map((tool) => ({
-      type: "function",
-      function: {
-        name: tool.name,
-        description: tool.description || "",
-        parameters: tool.input_schema || {}
-      }
-    }));
-  }
-
-  if (anthropicBody.stop_sequences) {
-    openaiBody.stop = anthropicBody.stop_sequences;
-  }
-
-  if (droppedImages > 0 && requestId) {
-    logWarn(requestId, "dropped image blocks; image source could not be converted", {
-      images: droppedImages,
-      model: anthropicBody.model
-    });
-  }
-  if (forwardedImages > 0 && requestId) {
-    logEvent(requestId, "forwarded image blocks to upstream", {
-      images: forwardedImages,
-      model: anthropicBody.model
-    });
-  }
-  return openaiBody;
-}
-
-// Convert OpenAI response to Anthropic format
-function convertOpenAIToAnthropic(openaiResp, model) {
-  const content = [];
-  if (openaiResp.reasoning_content) {
-    content.push({ type: "thinking", thinking: openaiResp.reasoning_content, signature: "" });
-  }
-  if (openaiResp.content) {
-    content.push({ type: "text", text: openaiResp.content });
-  }
-  if (openaiResp.tool_calls) {
-    for (const tc of openaiResp.tool_calls) {
-      let args = {};
-      try {
-        args = JSON.parse(tc.function.arguments);
-      } catch (e) {
-        args = {};
-      }
-      content.push({ type: "tool_use", id: tc.id, name: tc.function.name, input: args });
-    }
-  }
-  if (content.length === 0) {
-    content.push({ type: "text", text: "" });
-  }
-  let stopReason = "end_turn";
-  if (openaiResp.finish_reason === "tool_calls" || openaiResp.finish_reason === "function_call") {
-    stopReason = "tool_use";
-  } else if (openaiResp.finish_reason === "length") {
-    stopReason = "max_tokens";
-  } else if (openaiResp.finish_reason === "stop") {
-    stopReason = "end_turn";
-  }
-
-  return {
-    id: openaiResp.id || "msg_" + Date.now(),
-    type: "message",
-    role: "assistant",
-    model: toGatewayModelId(model),
-    content: content,
-    stop_reason: stopReason,
-    stop_sequence: null,
-    usage: {
-      input_tokens: openaiResp.usage ? Math.max(0, openaiResp.usage.prompt_tokens - (openaiResp.usage.cached_tokens || 0)) : 0,
-      output_tokens: openaiResp.usage ? openaiResp.usage.completion_tokens : 0,
-      ...(openaiResp.usage?.cached_tokens !== undefined ? { cache_read_input_tokens: openaiResp.usage.cached_tokens } : {})
-    }
-  };
-}
-
-function mapOpenAIFinishReason(finishReason) {
-  if (finishReason === "tool_calls" || finishReason === "function_call") {
-    return "tool_use";
-  }
-  if (finishReason === "length") {
-    return "max_tokens";
-  }
-  return "end_turn";
 }
 
 function writeWithBackpressure(res, payload) {
@@ -554,11 +315,12 @@ function startSseKeepAlive(res, requestId) {
   return () => clearInterval(timer);
 }
 
-async function openAnthropicStream(clientRes, model, requestId) {
+async function openAnthropicStream(clientRes, model, requestId, initialMessage = {}, headers = {}) {
   if (clientRes.destroyed || clientRes.writableEnded) {
     return false;
   }
   clientRes.writeHead(200, {
+    ...headers,
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
     Connection: "close"
@@ -572,283 +334,134 @@ async function openAnthropicStream(clientRes, model, requestId) {
       id: "msg_" + Date.now(),
       type: "message",
       role: "assistant",
-      model: toGatewayModelId(model),
       content: [],
       stop_reason: null,
       stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 }
+      usage: { input_tokens: 0, output_tokens: 0 },
+      ...initialMessage,
+      model: toGatewayModelId(model)
     }
   });
   await writeWithBackpressure(clientRes, `: waiting for upstream response\n\n`);
-  logEvent(requestId, "Anthropic SSE opened before upstream response", { model: model });
+  logEvent(requestId, "Anthropic SSE opened", { model: model });
   return true;
 }
 
-// Return the length of `text` excluding any trailing substring that could be
-// the start of `marker`, so a marker split across SSE chunks isn't emitted as
-// literal text before it can be matched. E.g. text "ab</thi", marker
-// "</think>" -> 2 (keep "</thi" buffered for the next fragment).
-function lengthWithoutTrailingPartial(text, marker) {
-  const maxOverlap = Math.min(text.length, marker.length - 1);
-  for (let n = maxOverlap; n > 0; n -= 1) {
-    if (text.slice(text.length - n) === marker.slice(0, n)) {
-      return text.length - n;
-    }
-  }
-  return text.length;
-}
-
-// Build a stateful Anthropic stream handler that converts incremental OpenAI SSE
-// chunks into Anthropic SSE events, matching the Claude Code wire protocol.
-// message_start is sent by openAnthropicStream before this handler runs, so this
-// handler only emits content blocks plus the trailing message_delta/message_stop.
-function createAnthropicStreamHandler(clientRes, model, requestId, requestBytes = 0, responseHandler = null) {
+// Both providers use Pi content events; only native Claude identity permits
+// signed/redacted thinking and the narrow opaque-block/citation extensions.
+function createAnthropicStreamHandler(clientRes, responseHandler = null) {
   const writeEvent = async (name, data) => {
     if (!responseHandler) return writeSseEvent(clientRes, name, data);
     for (const event of responseHandler.event(data)) await writeSseEvent(clientRes, event.type, event);
   };
-  const THINK_OPEN = "<think>";
-  const THINK_CLOSE = "</think>";
-  // GPT reasoning arrives only as Responses summary events, so a literal
-  // Keep provider-specific reasoning content separate from visible text.
-  const splitThinkTags = !isResponsesModel(model);
-
   let index = 0;
-  let sseChunks = 0;
-  let blockKind = null; // "text" | "thinking" | "tool_use" | null
-  let openToolOaiIndex = null; // OpenAI tool index of the currently open tool_use block
-  const seenToolIndexes = new Set();
-  let usage = null;
-  let emittedBytes = 0;
+  let blockKind = null;
+  let contentIndex = null;
+  let thinkingIsNative = false;
   let finished = false;
-  let lastFinishReason = null;
-  // Inline chain-of-thought (<think>...</think>) splitting on the content stream.
-  let insideThink = false;
-  let tagBuffer = "";
+  const blockIndices = new Map();
 
   const stopBlock = async () => {
-    if (blockKind === null) {
-      return;
+    if (blockKind === null) return;
+    if (blockKind === "thinking" && !thinkingIsNative) {
+      // Empty marks synthetic GPT thinking without exposing provider signatures.
+      await writeEvent("content_block_delta", { type: "content_block_delta", index,
+        delta: { type: "signature_delta", signature: "" } });
     }
-    if (blockKind === "thinking") {
-      // Anthropic thinking blocks carry a signature before they close. Upstream
-      // models can't produce a real one; emit a placeholder (the proxy strips
-      // thinking blocks before sending back upstream, so it's never validated).
-      await writeEvent("content_block_delta", {
-        type: "content_block_delta",
-        index: index,
-        delta: { type: "signature_delta", signature: "" }
-      });
-    }
-    await writeEvent("content_block_stop", {
-      type: "content_block_stop",
-      index: index
-    });
+    await writeEvent("content_block_stop", { type: "content_block_stop", index });
     blockKind = null;
-    openToolOaiIndex = null;
-    index += 1;
+    contentIndex = null;
+    index++;
   };
-
-  const openTextBlock = async () => {
+  const openBlock = async (kind, piIndex, block, native = false) => {
     await stopBlock();
-    await writeEvent("content_block_start", {
-      type: "content_block_start",
-      index: index,
-      content_block: { type: "text", text: "" }
-    });
-    blockKind = "text";
+    await writeEvent("content_block_start", { type: "content_block_start", index, content_block: block });
+    blockKind = kind;
+    contentIndex = piIndex;
+    thinkingIsNative = native;
+    blockIndices.set(piIndex, index);
   };
-
-  const openThinkingBlock = async () => {
-    await stopBlock();
-    await writeEvent("content_block_start", {
-      type: "content_block_start",
-      index: index,
-      content_block: { type: "thinking", thinking: "" }
-    });
-    blockKind = "thinking";
-  };
-
-  const openToolBlock = async (oaiIndex, id, name) => {
-    await stopBlock();
-    await writeEvent("content_block_start", {
-      type: "content_block_start",
-      index: index,
-      content_block: { type: "tool_use", id: id || `tool_${index}`, name: name || "", input: {} }
-    });
-    blockKind = "tool_use";
-    openToolOaiIndex = oaiIndex;
-  };
-
-  const emitAnswerText = async (text) => {
-    if (!text) {
-      return;
-    }
-    if (blockKind !== "text") {
-      await openTextBlock();
-    }
-    await writeEvent("content_block_delta", {
-      type: "content_block_delta",
-      index: index,
-      delta: { type: "text_delta", text: text }
-    });
-    sseChunks += 1;
-    emittedBytes += Buffer.byteLength(text);
-  };
-
-  const emitReasoningText = async (text) => {
-    if (!text) {
-      return;
-    }
-    if (blockKind !== "thinking") {
-      await openThinkingBlock();
-    }
-    await writeEvent("content_block_delta", {
-      type: "content_block_delta",
-      index: index,
-      delta: { type: "thinking_delta", thinking: text }
-    });
-    sseChunks += 1;
-    emittedBytes += Buffer.byteLength(text);
-  };
-
-  // Split a content fragment around <think>/</think>, routing text inside the
-  // tags to the thinking block and the rest to the answer block. Tags may
-  // straddle SSE chunks, so an incomplete trailing prefix is held in tagBuffer.
-  const feedContent = async (fragment) => {
-    tagBuffer += fragment;
-    while (tagBuffer.length > 0) {
-      const marker = insideThink ? THINK_CLOSE : THINK_OPEN;
-      const idx = tagBuffer.indexOf(marker);
-      if (idx !== -1) {
-        const before = tagBuffer.slice(0, idx);
-        if (insideThink) {
-          await emitReasoningText(before);
-        } else {
-          await emitAnswerText(before);
-        }
-        tagBuffer = tagBuffer.slice(idx + marker.length);
-        insideThink = !insideThink;
-        continue;
+  const applyPiEvent = async (event) => {
+    const native = event.partial?.api === "anthropic-messages" && event.partial?.provider === "github-copilot";
+    const block = event.partial?.content?.[event.contentIndex];
+    const kind = event.type.startsWith("thinking_") ? "thinking" : "text";
+    if (event.type === "native_block_start") {
+      await openBlock(event.block.type, event.contentIndex, event.block);
+    } else if (event.type === "native_block_delta") {
+      const wireIndex = blockIndices.get(event.contentIndex);
+      if (wireIndex === undefined) throw new Error("Native delta has no corresponding content block");
+      await writeEvent("content_block_delta", { type: "content_block_delta", index: wireIndex, delta: event.delta });
+    } else if (event.type === "native_block_stop") {
+      if (contentIndex === event.contentIndex) await stopBlock();
+    } else if (kind === "thinking" && block?.redacted) {
+      if (!native) return;
+      if (event.type === "thinking_start") {
+        await openBlock("redacted_thinking", event.contentIndex, { type: "redacted_thinking", data: block.thinkingSignature });
+      } else if (event.type === "thinking_end" && contentIndex === event.contentIndex) await stopBlock();
+    } else if (event.type === "text_start") {
+      await openBlock("text", event.contentIndex, { type: "text", text: "" });
+    } else if (event.type === "thinking_start" && native) {
+      await openBlock("thinking", event.contentIndex, { type: "thinking", thinking: "" }, true);
+    } else if (["text_delta", "thinking_delta"].includes(event.type)) {
+      // GPT encrypted-only reasoning never creates a visible block or signature.
+      if (!event.delta) return;
+      if (blockKind !== kind || contentIndex !== event.contentIndex) {
+        await openBlock(kind, event.contentIndex, kind === "thinking"
+          ? { type: "thinking", thinking: "" } : { type: "text", text: "" }, native);
       }
-      const safeLen = lengthWithoutTrailingPartial(tagBuffer, marker);
-      if (safeLen > 0) {
-        const ready = tagBuffer.slice(0, safeLen);
-        if (insideThink) {
-          await emitReasoningText(ready);
-        } else {
-          await emitAnswerText(ready);
-        }
-        tagBuffer = tagBuffer.slice(safeLen);
+      await writeEvent("content_block_delta", { type: "content_block_delta", index,
+        delta: kind === "thinking" ? { type: "thinking_delta", thinking: event.delta } : { type: "text_delta", text: event.delta } });
+    } else if (["text_end", "thinking_end"].includes(event.type)) {
+      if (event.type === "thinking_end" && native && block?.thinkingSignature !== undefined) {
+        if (contentIndex !== event.contentIndex) await openBlock("thinking", event.contentIndex, { type: "thinking", thinking: "" }, true);
+        await writeEvent("content_block_delta", { type: "content_block_delta", index,
+          delta: { type: "signature_delta", signature: block.thinkingSignature } });
       }
-      break;
+      if (contentIndex === event.contentIndex) await stopBlock();
+    } else if (event.type === "toolcall_end") {
+      // Wait for complete parsed arguments: parallel/interleaved partial calls
+      // must never create overlapping blocks or invalid input_json_delta JSON.
+      const call = event.toolCall;
+      await openBlock("tool_use", event.contentIndex,
+        { type: "tool_use", id: native ? call.id : call.id.split("|")[0], name: call.name, input: {} });
+      await writeEvent("content_block_delta", { type: "content_block_delta", index,
+        delta: { type: "input_json_delta", partial_json: JSON.stringify(call.arguments) } });
+      await stopBlock();
     }
   };
-
-  const flushContentBuffer = async () => {
-    if (tagBuffer.length > 0) {
-      if (insideThink) {
-        await emitReasoningText(tagBuffer);
-      } else {
-        await emitAnswerText(tagBuffer);
-      }
-      tagBuffer = "";
-    }
-  };
-
-  const applyOpenAiChunk = async (chunk) => {
-    const choice = (chunk && chunk.choices && chunk.choices[0]) || {};
-    const delta = choice.delta || {};
-    const finishReason = choice.finish_reason;
-    if (chunk && chunk.usage) {
-      usage = chunk.usage;
-    }
-
-    // Reasoning models stream chain-of-thought in a separate field; surface it
-    // as a thinking block, kept distinct from the answer text.
-    const reasoning = typeof delta.reasoning_content === "string"
-      ? delta.reasoning_content
-      : (typeof delta.reasoning === "string" ? delta.reasoning : "");
-    if (reasoning) {
-      await emitReasoningText(reasoning);
-    }
-
-    if (typeof delta.content === "string" && delta.content.length > 0) {
-      await (splitThinkTags ? feedContent(delta.content) : emitAnswerText(delta.content));
-    }
-
-    if (Array.isArray(delta.tool_calls)) {
-      for (const tc of delta.tool_calls) {
-        // First chunk of a tool call carries index+id+name; continuation chunks
-        // carry only argument fragments (often without index). Resolve the index
-        // and only open a new block when it's genuinely a new tool call.
-        const oaiIndex = typeof tc.index === "number"
-          ? tc.index
-          : (openToolOaiIndex !== null ? openToolOaiIndex : 0);
-        if (blockKind !== "tool_use" || openToolOaiIndex !== oaiIndex || !seenToolIndexes.has(oaiIndex)) {
-          seenToolIndexes.add(oaiIndex);
-          await openToolBlock(oaiIndex, tc.id, tc.function && tc.function.name);
-        }
-        const args = tc.function && tc.function.arguments;
-        if (typeof args === "string" && args) {
-          await writeEvent("content_block_delta", {
-            type: "content_block_delta",
-            index: index,
-            delta: { type: "input_json_delta", partial_json: args }
-          });
-          sseChunks += 1;
-          emittedBytes += Buffer.byteLength(args);
-        }
-      }
-    }
-
-    // Defer trailing events until usage has arrived.
-    if (finishReason) {
-      lastFinishReason = finishReason;
-    }
-  };
-
-  // Close any open block and emit the trailing message_delta/message_stop, then
-  // end the client stream. Idempotent: called once after the upstream stream
-  // ends (on [DONE] or socket end), by which point usage has been seen.
-  const finish = async () => {
-    if (finished) {
-      return;
-    }
+  const finish = async (message) => {
+    if (finished) return;
     finished = true;
-    await flushContentBuffer();
+    const carrier = message.content?.at(-1);
+    if (carrier?.type === "thinking" && isReplayCarrier(carrier.signature)) {
+      // Native mode: carry this exact signature instead of the synthetic empty one.
+      await openBlock("thinking", null, { type: "thinking", thinking: "" }, true);
+      await writeEvent("content_block_delta", { type: "content_block_delta", index,
+        delta: { type: "signature_delta", signature: carrier.signature } });
+    }
     await stopBlock();
-    const reported = usage || { prompt_tokens: 0, completion_tokens: 0 };
-    await writeEvent("message_delta", {
-      type: "message_delta",
-      delta: { stop_reason: mapOpenAIFinishReason(lastFinishReason), stop_sequence: null },
-      usage: {
-        input_tokens: Math.max(0, (reported.prompt_tokens || 0) - (reported.cached_tokens || 0)),
-        output_tokens: reported.completion_tokens || 0,
-        ...(reported.cached_tokens !== undefined ? { cache_read_input_tokens: reported.cached_tokens } : {})
-      }
-    });
+    const delta = { stop_reason: message.stop_reason, stop_sequence: message.stop_sequence ?? null };
+    if (message.stop_details !== undefined) delta.stop_details = message.stop_details;
+    await writeEvent("message_delta", { type: "message_delta", delta, usage: message.usage });
     await writeEvent("message_stop", { type: "message_stop" });
     await endWithBackpressure(clientRes);
   };
-
-  return { applyOpenAiChunk, finish, sseChunks: () => sseChunks };
+  return { applyPiEvent, finish };
 }
 
-function requestResponsesStream(openaiBody, model, primaryModel, requestId, clientRes, upstreamControl, responseHandler = null) {
-  logEvent(requestId, "OpenAI Responses stream started", { model });
-  const handler = createAnthropicStreamHandler(clientRes, model, requestId, 0, responseHandler);
-  return requestResponses(openaiBody, {
-    onChunk: handler.applyOpenAiChunk, control: upstreamControl,
-    onCacheUsage: (usage) => logEvent(requestId, "OpenAI prompt cache usage", usage)
-  })
-    .then(async (result) => {
-      await handler.finish();
-      return result;
-    });
+function requestPiStream(anthropicBody, model, requestId, clientRes, upstreamControl, responseHandler = null, requestOptions = {}) {
+  logEvent(requestId, "Pi stream started", { model });
+  const handler = createAnthropicStreamHandler(clientRes, responseHandler);
+  return requestPiModel(anthropicBody, {
+    ...requestOptions, onEvent: handler.applyPiEvent, control: upstreamControl,
+    onCacheUsage: (usage) => logEvent(requestId, "Prompt cache usage", usage)
+  }).then(async (message) => {
+    await handler.finish(message);
+    return message;
+  });
 }
 
-function streamToClient(openaiBody, model, primaryModel, requestId, clientRes, responseHandler = null) {
+function streamToClient(anthropicBody, model, requestId, clientRes, responseHandler = null, requestOptions = {}) {
   const upstreamControl = {};
   let completed = false;
   let clientClosed = false;
@@ -869,14 +482,20 @@ function streamToClient(openaiBody, model, primaryModel, requestId, clientRes, r
     }
   });
 
-  openAnthropicStream(clientRes, model, requestId)
-    .then((opened) => {
-      streamOpened = opened;
-      if (!opened || clientClosed || clientRes.destroyed || clientRes.writableEnded) {
-        return null;
-      }
+  const open = async (initialMessage, headers) => {
+    streamOpened = await openAnthropicStream(clientRes, model, requestId, initialMessage, headers);
+    if (streamOpened && !clientClosed && !clientRes.destroyed && !clientRes.writableEnded) {
       stopKeepAlive = startSseKeepAlive(clientRes, requestId);
-      return requestResponsesStream(openaiBody, model, primaryModel, requestId, clientRes, upstreamControl, responseHandler);
+    }
+    return streamOpened;
+  };
+  return Promise.resolve()
+    .then(async () => {
+      const nativeStart = requestOptions.route?.api === "anthropic-messages";
+      if (!nativeStart && !(await open())) return null;
+      if (clientClosed || clientRes.destroyed || clientRes.writableEnded) return null;
+      return requestPiStream(anthropicBody, model, requestId, clientRes, upstreamControl, responseHandler,
+        { ...requestOptions, onResponse: nativeStart ? open : undefined });
     })
     .then((result) => {
       completed = true;
@@ -898,32 +517,30 @@ function streamToClient(openaiBody, model, primaryModel, requestId, clientRes, r
         mode: "stream"
       });
       if (streamOpened && clientRes.headersSent) {
-        writeSseEvent(clientRes, "error", {
+        writeSseEvent(clientRes, "error", err.body || {
           type: "error",
           error: { type: getErrorType(err.status || 502), message: err.message }
         })
           .then(() => endWithBackpressure(clientRes))
           .catch(() => {});
       } else {
-        sendStreamError(clientRes, err.status || 502, err.message);
+        sendUpstreamError(clientRes, err);
       }
     });
 }
 
 // Claude Code 内置 WebSearch 的独立请求：执行上游原生搜索，按客户端要求以 JSON 或 SSE 返回搜索块。
 // 不支持的选项在请求上游前拒绝；SSE 先打开并保持 keepalive，客户端断开时取消上游。
-async function answerWebSearch(anthropicBody, search, model, requestId, res) {
+async function answerWebSearch(anthropicBody, search, model, requestId, res, capabilities) {
   if (search.error) {
     logWarn(requestId, "Web search request rejected", { model });
     sendJsonError(res, 400, search.error);
     return;
   }
-  const copilot = isClaudeModel(model);
-  if (!copilot && !isResponsesModel(model)) {
+  if (!capabilities.search) {
     sendJsonError(res, 400, `Built-in web search is not supported for model ${model || "(missing)"}`);
     return;
   }
-  const openaiBody = convertAnthropicToOpenAI({ ...anthropicBody, tools: [] }, requestId);
   const control = {};
   let stopKeepAlive = () => {};
   let finished = false;
@@ -936,7 +553,7 @@ async function answerWebSearch(anthropicBody, search, model, requestId, res) {
       if (!(await openAnthropicStream(res, model, requestId))) return;
       stopKeepAlive = startSseKeepAlive(res, requestId);
     }
-    const result = await runWebSearch(openaiBody, search, { copilot, control,
+    const result = await runWebSearch(anthropicBody, search, { capabilities, control,
       onCacheUsage: (usage) => logEvent(requestId, "OpenAI prompt cache usage", usage) });
     stopKeepAlive();
     logEvent(requestId, "Web search completed", { model: result.model, auth_kind: result.authKind, searches: result.searches, results: result.hits, capped: result.capped });
@@ -1072,54 +689,47 @@ const server = http.createServer(async (req, res) => {
         const model = configuredModel?.replace(/\[1m\]$/i, "");
         anthropicBody.model = model;
 
-        // count_tokens 等只读子路径保持原有转发，不执行真实搜索。
-        const search = readOnly ? null : parseWebSearchRequest(anthropicBody);
+        const operation = new URL(req.url, "http://localhost").pathname;
+        if (readOnly && operation !== "/v1/messages/count_tokens") { sendJsonError(res, 404, "Unsupported messages operation"); return; }
+        const route = await resolveGatewayModel(model, getAvailableModels);
+        if (!route?.api) { sendJsonError(res, 400, `Unsupported model: ${model || "(missing)"}`); return; }
+        const capabilities = getModelCapabilities(model, () => route);
+        if (readOnly) {
+          await countTokens(anthropicBody, req, res, capabilities);
+          return;
+        }
+        const search = parseWebSearchRequest(anthropicBody);
         if (search) {
-          await answerWebSearch(anthropicBody, search, model, requestId, res);
+          await answerWebSearch(anthropicBody, search, model, requestId, res, capabilities);
           return;
         }
-        if (isClaudeModel(model)) {
-          logEvent(requestId, "Copilot Claude request started", { model, stream: isStream });
-          try {
-            await forwardClaudeRequest(anthropicBody, req, res, {
-              onCacheUsage: (usage) => logEvent(requestId, "Copilot Claude prompt cache usage", usage), responseHandler
-            });
-          } catch (error) {
-            if (!res.destroyed && !res.writableEnded) {
-              if (!res.headersSent) sendJsonError(res, error.status || 502, error.message);
-              else sendStreamError(res, error.status || 502, error.message);
-            }
-          }
-          return;
-        }
-        if (!isResponsesModel(model)) { sendJsonError(res, 400, `Unsupported model: ${model || "(missing)"}`); return; }
-
-        if (new URL(req.url, "http://localhost").pathname === "/v1/messages/count_tokens") {
-          // This is a read-only local estimate, never a Responses generation request.
-          res.writeHead(200, { "Content-Type": "application/json", "X-Token-Count-Method": "conservative-utf8-estimate" });
-          res.end(JSON.stringify({ input_tokens: estimateInputTokens(anthropicBody) }));
-          return;
-        }
-        const openaiBody = convertAnthropicToOpenAI(anthropicBody, requestId);
-        openaiBody.prompt_cache_key = getPromptCacheKey(anthropicBody);
-        openaiBody.reasoning = getResponsesReasoning(anthropicBody);
+        const requestOptions = { route, clientHeaders: req.headers, url: req.url };
         if (isStream) {
-          // Client wants streaming - bridge OpenAI Responses events to Anthropic SSE.
-          streamToClient(openaiBody, model, model, requestId, res, responseHandler);
+          // Client wants streaming - bridge unified Pi events to Anthropic SSE.
+          streamToClient(anthropicBody, model, requestId, res, responseHandler, requestOptions);
         } else {
-          // Client wants non-streaming; collect a complete Responses result.
-          openaiBody.stream = false;
-          const assembled = await requestResponses(openaiBody, {
-            onCacheUsage: (usage) => logEvent(requestId, "OpenAI prompt cache usage", usage)
-          });
-          const anthropicResp = convertOpenAIToAnthropic(assembled, model);
-          anthropicResp.id = assembled.id || anthropicResp.id;
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(responseHandler ? responseHandler.message(anthropicResp) : anthropicResp));
+          const control = {};
+          let responseHeaders = {};
+          const onClose = () => {
+            if (!res.writableFinished) control.abort?.("Client closed before upstream response", 499);
+          };
+          res.on("close", onClose);
+          try {
+            const anthropicResp = await requestPiModel(anthropicBody, {
+              ...requestOptions, control,
+              onResponse: (_message, headers) => { responseHeaders = headers; },
+              onCacheUsage: (usage) => logEvent(requestId, "Prompt cache usage", usage)
+            });
+            if (res.destroyed || res.writableEnded) return;
+            res.writeHead(200, { ...responseHeaders, "Content-Type": "application/json" });
+            res.end(JSON.stringify(responseHandler ? responseHandler.message(anthropicResp) : anthropicResp));
+          } finally {
+            res.off("close", onClose);
+          }
         }
       } catch (error) {
         if (!res.destroyed && !res.writableEnded) {
-          if (!res.headersSent) sendJsonError(res, error.status || 502, error.message);
+          if (!res.headersSent) sendUpstreamError(res, error);
           else sendStreamError(res, error.status || 502, error.message);
         }
       }
@@ -1182,8 +792,6 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`claude-proxy running on http://127.0.0.1:${PORT}`);
   console.log(`本地登录页面：http://127.0.0.1:${PORT}/login`);
   console.log(`凭据存储目录：${credentialStore.directory}`);
-  // 仅在监听成功后异步同步 GPT 子代理默认模型；失败保留原配置，不输出可能包含凭据的错误。
-  claudeSetup.syncGptSubagentModel().catch(() => logWarn("claude-setup", "GPT subagent model sync failed; existing settings were kept. Retry on next proxy startup."));
   // 已登录 GPT 时异步探测并保存最大容量；未登录跳过，失败保留旧值，重启后重试。
   claudeSetup.syncGptContextCapacity().then((result) => {
     if (result.success) logEvent("claude-setup", "GPT context capacity saved", { tokens: result.tokens });

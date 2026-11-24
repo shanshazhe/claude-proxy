@@ -1,7 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { Readable } = require("stream");
-const { prepareClaudeCache, createClaudeCacheObserver } = require("../lib/anthropic-cache");
+const { prepareClaudeCache, reportClaudeCacheUsage } = require("../lib/anthropic-cache");
 
 const body = () => ({ model: "claude-sonnet-5.5", system: "private-system", tools: [{ name: "read", input_schema: { type: "object" } }],
   messages: [{ role: "user", content: "private-user" }] });
@@ -51,20 +50,10 @@ test("Claude automatic request caching and explicit disables are respected", () 
   finally { if (old === undefined) delete process.env.CLAUDE_PROMPT_CACHE; else process.env.CLAUDE_PROMPT_CACHE = old; }
 });
 
-async function observe(raw, stream, callback) {
-  const observer = createClaudeCacheObserver(prepareClaudeCache(body()), stream, callback);
-  const chunks = [];
-  observer.on("data", (chunk) => chunks.push(chunk));
-  const done = new Promise((resolve, reject) => { observer.on("end", resolve); observer.on("error", reject); });
-  Readable.from([Buffer.from(raw.slice(0, 17)), Buffer.from(raw.slice(17))]).pipe(observer);
-  await done;
-  return Buffer.concat(chunks).toString();
-}
-
-test("Claude SSE observer forwards exact bytes and reports merged native cache counters once", async () => {
-  const raw = 'event: message_start\r\ndata: {"type":"message_start","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":600,"cache_creation_input_tokens":300}}}\r\n\r\nevent: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"private-answer"}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":5}}\n\n';
+test("Claude reports merged native cache counters without logging content", () => {
   const stats = [];
-  assert.equal(await observe(raw, true, (usage) => stats.push(usage)), raw);
+  reportClaudeCacheUsage(prepareClaudeCache(body()), { input_tokens: 100, cache_read_input_tokens: 600,
+    cache_creation_input_tokens: 300, output_tokens: 5 }, (usage) => stats.push(usage));
   assert.equal(stats.length, 1);
   assert.equal(stats[0].total_input_tokens, 1000);
   assert.equal(stats[0].cache_read_input_tokens, 600);
@@ -76,13 +65,7 @@ test("Claude SSE observer forwards exact bytes and reports merged native cache c
   assert.ok(!JSON.stringify(stats).includes("private-"));
 });
 
-test("Claude JSON observer preserves bytes and malformed/oversized output never interrupts delivery", async () => {
-  const raw = '{"type":"message","content":[],"usage":{"input_tokens":0,"cache_read_input_tokens":0}}';
-  const stats = [];
-  assert.equal(await observe(raw, false, (usage) => stats.push(usage)), raw);
-  assert.equal(stats[0].cache_hit_percent, 0);
-  assert.equal(await observe("invalid-json", false, () => { throw Error("should not report"); }), "invalid-json");
-  const large = "x".repeat(1024 * 1024 + 1);
-  assert.equal(await observe(large, false, () => { throw Error("should not report"); }), large);
-  assert.equal(await observe(raw, false, () => { throw Error("diagnostic failure"); }), raw);
+test("Claude cache diagnostics tolerate zero usage and failing callbacks", () => {
+  reportClaudeCacheUsage(body(), {}, (stats) => { assert.equal(stats.cache_hit_percent, 0); });
+  assert.doesNotThrow(() => reportClaudeCacheUsage(body(), {}, () => { throw Error("diagnostic failure"); }));
 });

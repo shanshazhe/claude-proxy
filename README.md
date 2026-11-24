@@ -34,22 +34,24 @@ Claude Code / Anthropic Messages client
            ┌────────┴─────────────┐
            │                      │
        GPT models             Claude models
-   OpenAI Responses      Native Anthropic Messages
+      Pi AI adapter          Pi AI adapter
+   OpenAI Responses       Anthropic Messages
            │                      │
  OpenAI API or Codex        GitHub Copilot
 ```
 
-- GPT requests are converted to the Responses API, and responses are converted back to Anthropic Messages / SSE.
-- Claude requests use Copilot's native Messages endpoint, preserving thinking, signatures, tool events, and cache usage.
-- `/v1/models` merges the two dynamic catalogs available to the current credentials. There is no bundled static account model list.
-- `/login` manages local device authorization, CLI routing, Statusline setup, Online Summary settings, optional macOS service registration, and the gateway-maintained Project Code Memory switch. It does not collect account passwords.
-- The proxy uses CommonJS and Node.js built-in modules; there is no build step or npm runtime dependency.
+- GPT and Copilot Claude generation use the pinned `@earendil-works/pi-ai@1.6.0` runtime dependency, through OpenAI / Codex Responses and Anthropic Messages transports respectively. Both share an internal request dispatcher and a Pi-to-Anthropic response bridge; the external API remains Anthropic Messages JSON / SSE. The gateway does not add a second agent loop or execute client tools.
+- GPT and Claude generation both use Pi's model registry and `Models.stream()` with a normalized transcript. The live, account-scoped catalog determines routing from provider and API metadata, not model-name patterns. Provider-only controls that Pi cannot express are handled at its provider boundary.
+- Token counting and server search are separate operations. Counting uses the native read-only endpoint where registered and a marked local estimate otherwise; it never invokes generation. Search uses a registered Pi-backed capability on the same account.
+- `/v1/models` merges the two dynamic catalogs available to the current credentials. There is no bundled static account model list; Pi's bundled catalog does not replace account-driven discovery, add providers, or add a new model menu.
+- `/login` manages local device authorization, CLI routing, Statusline setup, Online Summary settings, optional macOS service registration, and the gateway-maintained Project Code Memory switch. It does not collect account passwords. Login, credential storage, and the `OPENAI_API_KEY` override priority remain gateway-managed.
+- The proxy remains CommonJS and loads Pi through dynamic `import()`. There is no build step, but npm runtime dependencies must be installed with `npm ci` before launching.
 
 Source layout: `lib/` contains provider, login, secure storage, setup, and cache modules; `web/login.html` is the local page; `mac/` and `windows/` contain platform proxies and launchers; `scripts/` contains feature-toggle utilities; and `test/` contains offline tests. The two `proxy.js` files are identical.
 
 ## Prerequisites
 
-1. **Node.js 22.15+ (22.x), or a newer supported LTS release.** The launchers require `--use-system-ca` to include trusted system certificates while keeping TLS verification enabled. The implementation also requires built-in `fetch`, Web Streams, `structuredClone`, and related APIs.
+1. **Node.js 22.19.0+ and npm** (or a newer supported LTS release meeting the same minimum). The package declares `engines.node >=22.19.0`; install its pinned runtime dependencies with `npm ci`. The launchers retain `--use-system-ca` to include trusted system certificates while keeping TLS verification enabled. The implementation also requires built-in `fetch`, Web Streams, `structuredClone`, and related APIs.
 2. To use the CLI configuration button, install **Claude Code** first and ensure the CLI can be found by the version probe. The gateway does not install it automatically.
 3. At least one type of upstream access:
    - A ChatGPT account that supports Codex device authorization and the requested models, or an OpenAI API key with API quota.
@@ -60,12 +62,13 @@ Successful login does not grant access to every model. Subscriptions, organizati
 
 ## Starting the proxy
 
-Run the following commands from the project root. Both launchers and the direct-start examples below enable `--use-system-ca`, so the proxy trusts system-installed CAs (including trusted enterprise certificates) without disabling TLS verification. If the required CA is not in the system trust store, install it there or set `NODE_EXTRA_CA_CERTS` to a trusted PEM certificate bundle before starting the proxy.
+Run the following commands from the project root. Run `npm ci` before the first launch and after updating the dependency lockfile; this also applies when using the direct-start examples. Both launchers and the direct-start examples below enable `--use-system-ca`, so the proxy trusts system-installed CAs (including trusted enterprise certificates) without disabling TLS verification. If the required CA is not in the system trust store, install it there or set `NODE_EXTRA_CA_CERTS` to a trusted PEM certificate bundle before starting the proxy.
 
 ### macOS / Linux
 
 ```bash
 node --version
+npm ci
 bash mac/start-proxy.sh
 ```
 
@@ -87,6 +90,7 @@ From Command Prompt:
 
 ```bat
 node --version
+npm ci
 windows\start-proxy.bat
 ```
 
@@ -178,7 +182,7 @@ The configuration button merges these fields:
 }
 ```
 
-`sk-placeholder` is a local routing placeholder, not an upstream API key. The operation removes the superseded `env.ANTHROPIC_AUTH_TOKEN` while preserving unrelated environment variables, hooks, permissions, plugins, `model`, and an existing `statusLine`. An existing explicit model is retained when available; otherwise, the first catalog entry matching the credentials is selected. No fixed model version is installed. The separate startup-only GPT subagent sync below does not change the main session model or gateway routing fields.
+`sk-placeholder` is a local routing placeholder, not an upstream API key. The operation removes the superseded `env.ANTHROPIC_AUTH_TOKEN` while preserving unrelated environment variables, hooks, permissions, plugins, `model`, and an existing `statusLine`. An existing explicit model is retained when available; otherwise, the first catalog entry matching the credentials is selected. No fixed model version is installed.
 
 Before writing, the original settings bytes, including any BOM and formatting, are backed up to:
 
@@ -190,26 +194,11 @@ The backup directory and regular backup files are private. Configuration operati
 
 Conflicts such as `apiKeyHelper`, `proxyAuthHelper`, forced login settings, other cloud authentication modes, or gateway helpers must be resolved manually; the button does not silently delete them. Shell, project, local, and managed settings may still override user settings. The proxy does not read or write Claude's `.credentials.json`.
 
-**Importing modules, opening the page, and querying status do not write CLI settings.** Main-session gateway configuration runs only through a local nonce-protected, same-origin JSON `POST /api/auth/claude/configure` with a body of `{}`. Automatic settings exceptions are limited to GPT subagent defaults on proxy startup and GPT context capacity after login or proxy startup, as described below. To restore settings, first stop using the gateway, inspect the relevant private backup, and restore the required fields manually. Do not overwrite personal settings added since the backup.
+**Importing modules, opening the page, and querying status do not write CLI settings.** Main-session gateway configuration runs only through a local nonce-protected, same-origin JSON `POST /api/auth/claude/configure` with a body of `{}`. The automatic settings write described below saves GPT context capacity after login or proxy startup. To restore settings, first stop using the gateway, inspect the relevant private backup, and restore the required fields manually. Do not overwrite personal settings added since the backup.
 
-### Automatic GPT subagent defaults on proxy startup
+### Subagent model selection
 
-After successfully binding the port, both platform proxies start one nonblocking sync using the current GPT credentials and dynamic model catalog. This does not wait before serving requests, run on a failed bind, or poll in the background. It writes only these two environment settings in the actual CLI settings file:
-
-```json
-{
-  "env": {
-    "CLAUDE_CODE_SUBAGENT_MODEL": "<canonical anthropic/GPT ID selected from the current catalog>",
-    "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"
-  }
-}
-```
-
-Selection prefers an existing available GPT subagent model, then an available GPT `env.ANTHROPIC_MODEL`, then an available GPT top-level `model`, then the first available GPT catalog entry. It never hardcodes a GPT version or adds `[1m]` to GPT IDs. `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` requires **Claude Code v2.1.257+**: ordinary subagents use the selected GPT even when their definitions request another model. Official forked-agent inheritance and skills using `model: inherit` remain exceptions and follow Claude Code's own inheritance rules.
-
-GPT credentials may be saved OAuth credentials, a saved API key, or `OPENAI_API_KEY`. An expired saved OAuth access token is not treated as logout; startup does not initiate a login request. Without valid GPT credentials (including credentials removed while discovery is pending), the sync skips without changing or deleting existing defaults; with no available GPT model, it also keeps settings unchanged. Unsafe settings or discovery/save failures leave the existing settings intact and produce a fixed, credential-safe warning. Retry happens on the next proxy startup, not a timer.
-
-Writes use the private exact-byte backups and serialized, conflict-checked atomic settings merge described above. Repeated startups with identical values do not rewrite settings or create another backup. Unrelated settings, the main session's `model` / `ANTHROPIC_MODEL`, and gateway routing fields are preserved: configuring the main session still requires the website button. Existing Claude processes do not reload their environment; start a new CLI session to use the defaults.
+The proxy does not set or overwrite `CLAUDE_CODE_SUBAGENT_MODEL` or `CLAUDE_CODE_SUBAGENT_MODEL_FORCE`. Subagents configured to inherit follow the active main-session model, including changes made with `/model`; agents with their own model can still use it. If a previous proxy version wrote the two environment settings, remove them from the CLI settings file and start a new CLI session to restore Claude Code's normal model selection. Keep any overrides you intentionally configured.
 
 ### Automatic GPT capacity after login and proxy startup
 
@@ -233,7 +222,7 @@ Missing GPT credentials skip discovery and writes. Copilot login alone does not 
 
 Claude Code 2.1.303's gateway discovery keeps model IDs, names, and descriptions, but does not use catalog capacity metadata to set GPT's session window. With local GPT credentials available, `lib/claude-launch.js` fetches `/v1/models?provider=gpt&wait_for_refresh=true` on **each session start** (15-second timeout, waiting for an expired or missing GPT-only catalog to refresh within the 12-second upstream deadline) and passes `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the official CLI. This uses an independent GPT-only cache and never starts or waits for Copilot discovery; a partial or empty full-catalog cache cannot suppress the GPT query. Ordinary `/v1/models` discovery and the `/model` menu still include both providers. The launcher does not patch the official executable, require a pinned CLI version, or itself write capacity to settings; the separate login/startup sync above maintains the persisted value.
 
-All automatic GPT behaviors—subagent defaults sync, persisted capacity sync, capacity launcher installation, and CLI context injection—require the same local GPT credentials: structurally valid saved OAuth, a saved API key, or a nonblank `OPENAI_API_KEY`. Copilot-only credentials do not qualify. An expired OAuth access token still counts as logged in; this check never refreshes tokens or verifies them online. Missing or unreadable credentials skip automatic changes without deleting existing settings or an installed launcher. The launcher then starts the official CLI with the original arguments and environment, including any caller-provided `CLAUDE_CODE_MAX_CONTEXT_TOKENS`; a cached GPT catalog cannot bypass the check.
+All automatic GPT capacity behaviors—persisted capacity sync, capacity launcher installation, and CLI context injection—require the same local GPT credentials: structurally valid saved OAuth, a saved API key, or a nonblank `OPENAI_API_KEY`. Copilot-only credentials do not qualify. An expired OAuth access token still counts as logged in; this check never refreshes tokens or verifies them online. Missing or unreadable credentials skip automatic changes without deleting existing settings or an installed launcher. The launcher then starts the official CLI with the original arguments and environment, including any caller-provided `CLAUDE_CODE_MAX_CONTEXT_TOKENS`; a cached GPT catalog cannot bypass the check.
 
 There are three separate steps:
 
@@ -281,9 +270,9 @@ After disabling, open a new terminal (or `unfunction claude` in the current one)
 
 ## Configuring Statusline
 
-The status-display card on `/login` follows the **proxy host's platform**, not the browser's platform. It is independent of ChatGPT / Copilot login and CLI routing. Both platform paths accept only an empty JSON object at `POST /api/auth/statusline/configure` under the local page's security guards.
+The status-display card on `/login` follows the **proxy host's platform**, not the browser's platform. It is independent of ChatGPT / Copilot login and CLI routing. Both platform paths use `POST /api/auth/statusline/configure` under the local page's security guards. The Windows HUD toggle sends `{ "enabled": true/false }`; the bundled statusline action sends an empty object.
 
-**Windows — Claude HUD:** the page shows only the Claude HUD card. Once Claude CLI is detected, check **Install claude-hud** to install `claude-hud@claude-hud` from `jarrodwatts/claude-hud` using the official plugin commands and the actual `CLAUDE_CONFIG_DIR`. No additional dependency, settings, marketplace-source or installed-file checks are performed. Then run `/reload-plugins` and `/hud` in Claude Code to finish setup. Unchecking is not an uninstall action; the checkbox is disabled after a successful install during this proxy run. Installation errors leave it available to retry.
+**Windows — Configure Claude HUD:** **Enable claude-hud** behaves as an on/off switch, like Project Code Memory. Turning it on installs the plugin if needed and enables it through the official Claude CLI commands; then run `/reload-plugins` and `/hud` to finish setup. Turning it off disables the plugin and removes only this configuration root's HUD statusLine command, retaining plugin files and unrelated settings. The checked state reads Claude's persisted enabledPlugins setting and survives proxy restarts. An enabled checkbox remains editable; operations temporarily disable it and failures restore the actual state.
 
 **macOS / Linux — Configure Statusline:** keeps the bundled Bash/jq implementation described below. It requires a discoverable Claude CLI, **Bash 3+**, and **jq 1.6+**; Node.js is not needed by the statusline. Missing dependencies are never downloaded automatically.
 
@@ -414,10 +403,11 @@ Use `/login` for login and configuration operations; these endpoints do not supp
 
 ## Streaming, tools, images, and reasoning
 
-- **Non-streaming GPT:** Converts the request, collects the Responses result, and maps text, tool calls, stop reasons, and usage. A local non-streaming client still receives complete JSON even when the Codex upstream requires SSE.
-- **Streaming GPT:** Sends Anthropic `message_start`, converts Responses text, reasoning summaries, and complete tool-call events as they arrive, then sends usage, `message_delta`, and `message_stop`. SSE keepalives are sent while waiting. Writes honor backpressure, and a genuine client disconnect cancels the upstream request.
-- **Copilot Claude:** Forwards native Messages JSON or SSE, preserving response bytes, signatures, tool-argument fragments, and error events, with backpressure and client cancellation.
+- **Non-streaming GPT:** Converts the request to Pi input, collects the Pi result from the Responses upstream, and maps text, tool calls, stop reasons, and usage. A local non-streaming client still receives complete JSON even when the Codex upstream requires SSE.
+- **Streaming GPT:** Sends Anthropic `message_start`, converts Pi text, reasoning, and tool-call events from the Responses upstream, then sends usage, `message_delta`, and `message_stop`. SSE keepalives are sent while waiting. Writes honor backpressure, and a genuine client disconnect cancels the upstream request.
+- **Copilot Claude:** Converts the incoming request into the same Pi transcript as GPT, then Pi builds the upstream Messages request. The shared response bridge returns Anthropic JSON or SSE, including signed/redacted thinking, tools, stop metadata, cache usage, and upstream errors. Recognized Claude-native blocks, including existing signatures, server-tool history, and explicit cache breakpoints, are preserved on the Claude path; the upstream validates the signatures. Unsigned GPT thinking does not become signed Claude history. Unrecognized blocks are rejected rather than silently dropped.
 - **Tools:** Maps `tool_use` / `tool_result`. Results immediately follow their corresponding tool calls, before any user text supplied alongside them. The client remains responsible for executing tools requested by the upstream model.
+- **Claude-only history on GPT:** Top-level `document`, server-tool history (such as `server_tool_use` / `web_search_tool_result`), `compaction`, and the other Claude-native block types have no Responses equivalent, so they are dropped from GPT requests instead of failing them. Other unrecognized blocks are still rejected.
 - **Images:** Ordinary GPT image blocks become Responses `input_image` items. Images in tool results are attached to a following multimodal user message. Copilot receives native image structures and a vision request header. Image support depends on the selected model and account; unsupported or invalid sources are replaced with explanatory text.
 - **Reasoning:** GPT supports public reasoning summaries, not native Claude's full thinking / signature protocol. Literal `<think>` text in an answer is not misclassified as a GPT reasoning block. Copilot adapts adaptive thinking using catalog capabilities while preserving native signatures and compatibility fallbacks.
 
@@ -425,7 +415,7 @@ The request-body limit is 32 MiB. OpenAI requests have a one-hour total timeout 
 
 ## Built-in WebSearch
 
-Claude Code's built-in **WebSearch** tool sends its own request whose only tool is `web_search_20250305` (on the wire `tool_choice` is `auto`). The proxy recognizes that request, runs OpenAI's native Responses `web_search` upstream with the search required, and returns the real calls and sources as `server_tool_use` / `web_search_tool_result` blocks (JSON or SSE) with `end_turn`. Claude Code then hands the titles and URLs to the main conversation. `count_tokens` subpaths are never searched.
+Claude Code's built-in **WebSearch** tool sends its own request whose only tool is `web_search_20250305` (on the wire `tool_choice` is `auto`). The proxy recognizes that request, runs OpenAI's native Responses `web_search` upstream through Pi's payload/event hooks with the search required, and returns the real calls and sources as `server_tool_use` / `web_search_tool_result` blocks (JSON or SSE) with `end_turn`. Claude Code then hands the titles and URLs to the main conversation. `count_tokens` subpaths are never searched.
 
 | Session model | Where the search runs |
 | --- | --- |
@@ -451,7 +441,7 @@ Responses `input_tokens_details.cached_tokens` maps to Anthropic `usage.cache_re
 
 Unless an explicit top-level `cache_control` or a disable switch is present, the proxy adds `ephemeral` annotations to eligible tools, system content, and the last user content, respecting existing markers and TTL ordering. It allows at most four block markers and does not overwrite existing annotations. Long-before-short ordering and neighboring TTLs remain compatible.
 
-Copilot's native usage fields, including `cache_read_input_tokens` and `cache_creation_input_tokens`, are returned unchanged. A separate observer inspects JSON / SSE usage while immediately forwarding the original bytes. Unknown or oversized events skip diagnostics without changing the response, and a failing statistics callback does not interrupt native output.
+Copilot's native usage fields, including `cache_read_input_tokens` and `cache_creation_input_tokens`, are preserved in the Anthropic JSON / SSE output assembled from Pi results and native metadata. The Claude adapter retains existing cache preparation, explicit markers, and native thinking signatures without using GPT's Responses replay cache. A failing statistics callback does not interrupt the response.
 
 ### Responses replay and other local caches
 
@@ -470,6 +460,8 @@ Online Summary keeps large tool outputs from filling your main model's context. 
 Up to 20 excerpts of up to 40 lines are included, without repeating overlapping lines, within half of the original size (4,000 to 12,000 characters). Excerpts that do not fit are listed by line range and reason so the main model can jump straight to them.
 
 **Summary model.** By default the proxy picks the newest Luna model (for example `gpt-6-luna`, which needs ChatGPT login or `OPENAI_API_KEY`) and falls back to the newest Haiku model (Copilot). The detection is cached until the proxy restarts. You can choose another GPT or Copilot Claude model on `/login`; a chosen model is tried first and falls back to Luna, then Haiku, if it fails. Each summary has a 30-second timeout. Outputs over 1 MiB are sent to the model as their first and last ~512 KiB with the omitted line range noted. If every model fails, the original output is kept.
+
+GPT and Claude summaries and background completions use the same Pi dispatcher as generation, with replay disabled (`remember: false`) and agent initiation (`agent: true`, setting Copilot's `X-Initiator: agent`). This is a single model request per attempt, not a second agent loop; existing model selection, prompts, settings, and fallback controls are unchanged.
 
 **Summary prompt.** The `/login` card displays the current system prompt sent to the summary model. Edit it and click **Save prompt** to persist `summaryPrompt` without restarting the proxy. It must be non-empty and fit within 8 KiB after JSON encoding. Keep the JSON reply contract with `summary` and `highlights`; malformed model replies fail safely to the original output. **Reset to default** removes the override, as does saving text equivalent to the built-in prompt, so later built-in updates still apply. Status refreshes preserve unsaved edits.
 
@@ -554,7 +546,8 @@ A custom `OPENAI_BASE_URL` receives the API key, model requests, and conversatio
 | Symptom | What to check |
 | --- | --- |
 | Proxy cannot listen / port already in use | Ensure only one proxy is running, inspect port 8082, and manually stop any unwanted process |
-| `node: bad option: --use-system-ca` | Upgrade to Node.js 22.15+ (22.x) or a newer supported LTS release, and check which `node` is on PATH |
+| `node: bad option: --use-system-ca` | Upgrade to Node.js 22.19.0+ or a newer supported LTS release, and check which `node` is on PATH |
+| Pi dependency cannot be imported / `ERR_MODULE_NOT_FOUND` | Run `npm ci` from the project root, confirm Node.js is at least 22.19.0, and restart the proxy |
 | TLS certificate errors / `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` / `SELF_SIGNED_CERT_IN_CHAIN` | Use the launcher or include `--use-system-ca` when starting Node. Ensure the required CA is trusted by the system, or set `NODE_EXTRA_CA_CERTS` to a trusted PEM bundle; do not disable TLS verification |
 | Login page does not open | Use `127.0.0.1:8082/login`; the proxy binds only IPv4 loopback, and localhost / IPv6 resolution may differ by environment |
 | Login status returns 403 | Reload the local page to refresh its nonce; do not use another Host, a proxy, a cross-origin page, or a POST without Origin |
@@ -578,9 +571,10 @@ A custom `OPENAI_BASE_URL` receives the API key, model requests, and conversatio
 
 ## Offline tests
 
-From the project root:
+From the project root, using Node.js 22.19.0+ and the locked npm dependencies (dependency installation requires registry access unless already cached):
 
 ```bash
+npm ci
 node --test test/*.test.js
 node --check mac/proxy.js
 node --check windows/proxy.js
@@ -603,9 +597,11 @@ In Windows PowerShell, create a separate temporary directory and set `HOME`, `US
 
 The default suite uses mocked upstreams and temporary directories. It covers device authorization, token-refresh races, catalog invalidation, JSON / SSE, tools / images, cache usage, Responses replay, genuine client disconnects, login-route security, and private settings backups. HTTP end-to-end tests exercise both GPT and Copilot paths and reject unknown models. Statusline tests deploy/run only in temporary roots with synthetic input. Service tests mock system-management commands and run fake proxies on random non-8082 ports; VM/e2e tests inject a fake service. Project Code Memory tests use temporary CLI roots, fake dependency/model calls, and isolated Python `pcm.py` runs in temporary repositories, covering exact-file recognition, explicit backup replacement, known-older automatic upgrades, symlink/path safety, first-start enablement, explicit off, serialized installation/removal, empty-target races, publication-failure recovery, backup/cache retention, local JSON/SSE replies, record validation, and failed-write cleanup. Online Summary tests use temporary settings/archive roots and fake summary models. No real Statusline configuration, global skill installation, or launchd registration/restart is performed.
 
-Capacity-launcher tests use temporary homes/config roots for adoption, path refresh, persistent opt-out, private digest backups, shell conflicts, permissions/symlinks, syntax failures, concurrent edits, fresh-zsh argument forwarding, and Node PATH/fallback behavior. Full-startup VM tests cover the branch after the inert legacy settings-sync boundary: launcher installation, GPT subagent sync, and maximum-capacity sync run only after listening succeeds, never block startup, and only warn on failure. Post-login tests verify fresh GPT-only maximum-capacity discovery, Copilot-login isolation, and preserving old values on failure. GPT sync tests inject a temporary config root, empty environment, mock credential store, and fake dynamic catalog into the real setup factory, covering absent/disappearing credentials, invalid capacities, superseded discoveries, exact backups, idempotent restarts, startup retries, unrelated-settings preservation, and credential-safe failure logging. They do not restart the current proxy or modify real user settings or `.zshrc`.
+Capacity-launcher tests use temporary homes/config roots for adoption, path refresh, persistent opt-out, private digest backups, shell conflicts, permissions/symlinks, syntax failures, concurrent edits, fresh-zsh argument forwarding, and Node PATH/fallback behavior. Full-startup VM tests cover the branch after the inert legacy settings-sync boundary: launcher installation and maximum-capacity sync run only after listening succeeds, never block startup, and only warn on failure. The tests also check that startup does not add or overwrite subagent model settings. Post-login tests verify fresh GPT-only maximum-capacity discovery, Copilot-login isolation, and preserving old values on failure. GPT capacity sync tests inject a temporary config root, empty environment, mock credential store, and fake dynamic catalog into the real setup factory, covering absent/disappearing credentials, invalid capacities, superseded discoveries, exact backups, idempotent restarts, startup retries, unrelated-settings preservation, and credential-safe failure logging. They do not restart the current proxy or modify real user settings or `.zshrc`.
 
 Historical installer upgrade tests read original Git blobs at `f3fab02` and `530542c^`; the checkout must include those objects (a history-free archive or overly shallow clone is insufficient).
+
+Run `node --test test/provider-parity.test.js` to compare the current gateway against pre-Pi commit `3154dc1cbcf71756d5054747ac102b7bc48086a8`, which must be present in local Git history. It sends two-turn Claude and Codex conversations to each gateway on loopback with mocked upstreams. It compares the reconstructed client responses and captured upstream requests, including tool-result linkage, Claude signatures and cache controls, and byte-exact Codex replay. It records known wire differences rather than assuming they have identical behavior on a live provider.
 
 `claude-cli.test.js` is skipped by default. Set `RUN_CLAUDE_CLI_TESTS=1` only when explicitly choosing to run isolated checks with the locally installed CLI. It still uses mocked gateways and does not validate real account authorization or real upstream access.
 
