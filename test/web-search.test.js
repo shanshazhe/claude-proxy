@@ -1,4 +1,10 @@
 const test = require("node:test");
+const { getModelCapabilities, countTokens } = require("../lib/pi-capabilities");
+const { setGatewayModels } = require("../lib/pi-registry");
+setGatewayModels([
+  ...["gpt-5.4", "gpt-6.1-sol"].map((id) => ({ id, api: "openai-responses", owned_by: "openai" })),
+  { id: "claude-opus-5.5", api: "anthropic-messages", owned_by: "github-copilot" }
+]);
 const assert = require("node:assert/strict");
 const { parseWebSearchRequest, runWebSearch, toAnthropicContent, toAnthropicMessage, toAnthropicEvents } = require("../lib/web-search");
 
@@ -59,7 +65,7 @@ test("zero hits, missing sources, failed calls and answers without a search are 
 
 test("JSON and SSE carry the same blocks, with input as JSON deltas and end_turn", () => {
   const result = { ...toAnthropicContent([call("ws_1", [{ type: "url", url: "https://nodejs.org/" }]), message("Summary.")]),
-    usage: { prompt_tokens: 100, completion_tokens: 20, cached_tokens: 40 } };
+    usage: { input_tokens: 60, output_tokens: 20, cache_read_input_tokens: 40 } };
   const json = toAnthropicMessage(result, "claude-opus-5.5");
   assert.equal(json.stop_reason, "end_turn");
   assert.deepEqual(json.usage, { input_tokens: 60, output_tokens: 20, cache_read_input_tokens: 40, server_tool_use: { web_search_requests: 1 } });
@@ -73,6 +79,25 @@ test("JSON and SSE carry the same blocks, with input as JSON deltas and end_turn
   assert.equal(events.at(-2)[1].delta.stop_reason, "end_turn");
 });
 
+test("operation capabilities follow catalog metadata rather than model names", async () => {
+  const resolve = (row) => getModelCapabilities("arbitrary-model", () => row);
+  assert.deepEqual(resolve({ api: "anthropic-messages", owned_by: "github-copilot" }), { count: "native", search: "copilot-responses" });
+  assert.deepEqual(resolve({ api: "openai-responses", owned_by: "openai" }), { count: "estimate", search: "responses" });
+  assert.deepEqual(resolve({ api: "openai-responses", owned_by: "github-copilot" }), { count: "estimate", search: "copilot-responses" });
+  assert.deepEqual(resolve({ api: "other", owned_by: "openai" }), { count: null, search: null });
+  let output;
+  let headers;
+  await countTokens({ model: "arbitrary-model", messages: [] }, {}, {
+    writeHead(status, value) { assert.equal(status, 200); headers = value; },
+    end(value) { output = JSON.parse(value); }
+  }, { count: "estimate" });
+  assert.equal(headers["X-Token-Count-Method"], "conservative-utf8-estimate");
+  assert.equal(typeof output.input_tokens, "number");
+  await assert.rejects(runWebSearch({ model: "gpt-looking-but-unsupported" }, {}, {
+    capabilities: { search: null }, requestGptImpl() { assert.fail("must not generate"); }
+  }), /not supported/);
+});
+
 function fakeResponses(script) {
   const seen = [];
   const impl = async (body, options) => {
@@ -80,10 +105,10 @@ function fakeResponses(script) {
     options.adjustPayload(payload, { kind: script.kind || "codex" });
     seen.push({ body, payload, options });
     for (const event of script.events) {
-      options.onEvent(event);
+      await options.onProviderEvent(event);
       if (options.control.aborted) throw Object.assign(new Error("aborted"), { status: 502 });
     }
-    return { usage: { prompt_tokens: 10, completion_tokens: 2, cached_tokens: 0 } };
+    return { usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0 } };
   };
   return { impl, seen };
 }
@@ -93,8 +118,14 @@ const done = (index, item) => ({ type: "response.output_item.done", output_index
 test("GPT searches keep their model and recover items when the completed output is empty", async () => {
   const { impl, seen } = fakeResponses({ events: [added(0, "ws_1"), done(0, call("ws_1", [{ type: "url", url: "https://nodejs.org/" }])),
     done(1, message("Summary.")), { type: "response.completed", response: { status: "completed", output: [] } }] });
-  const result = await runWebSearch({ model: "gpt-6.1-sol", messages: [] }, parseWebSearchRequest(request({ allowed_domains: ["nodejs.org"] })),
-    { requestResponsesImpl: impl });
+  const body = request({ allowed_domains: ["nodejs.org"] }, { model: "gpt-6.1-sol", system: "search policy", max_tokens: 100 });
+  const result = await runWebSearch(body, parseWebSearchRequest(body), { requestGptImpl: impl });
+  assert.equal(seen[0].body.system, "search policy");
+  assert.equal(seen[0].body.max_tokens, 100);
+  assert.deepEqual(seen[0].body.messages, body.messages);
+  assert.equal(seen[0].body.tools, undefined);
+  assert.equal(seen[0].body.tool_choice, undefined);
+  assert.deepEqual(result.usage, { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0 });
   assert.equal(seen[0].body.model, "gpt-6.1-sol");
   assert.equal(seen[0].options.remember, false);
   assert.deepEqual(seen[0].payload.tools, [{ type: "web_search", filters: { allowed_domains: ["nodejs.org"] } }]);
@@ -111,12 +142,18 @@ test("Claude sessions search through Copilot's newest Luna with the native call 
   const { impl, seen } = fakeResponses({ kind: "copilot", events: [added(0, "ws_1"), done(0, call("ws_1", [])),
     { type: "response.completed", response: { status: "completed", output: [call("ws_1", [])] } }] });
   const result = await runWebSearch({ model: "claude-opus-5.5", messages: [] }, parseWebSearchRequest(request()),
-    { copilot: true, requestResponsesImpl: impl, listCopilotModels: async () => ["gpt-5.6-luna", "gpt-6-luna", "gpt-6.1-sol", "claude-opus-5.5"] });
+    { requestGptImpl: impl, listCopilotModels: async () => ["gpt-5.6-luna", "gpt-6-luna", "gpt-6.1-sol", "claude-opus-5.5"] });
   assert.equal(seen[0].body.model, "gpt-6-luna");
   assert.equal(typeof seen[0].options.loadAuth, "function");
   assert.equal(seen[0].payload.max_tool_calls, 8);
+  await runWebSearch({ model: "catalog-responses-model", messages: [] }, parseWebSearchRequest(request()), {
+    capabilities: getModelCapabilities("catalog-responses-model", () => ({ api: "openai-responses", owned_by: "github-copilot" })),
+    requestGptImpl: impl, listCopilotModels: async () => ["gpt-6-luna"]
+  });
+  assert.equal(typeof seen[1].options.loadAuth, "function");
+  assert.equal(seen[1].body.model, "gpt-6-luna");
   assert.deepEqual([result.model, result.authKind, result.hits], ["gpt-6-luna", "copilot", 0]);
-  await assert.rejects(runWebSearch({ model: "claude-opus-5.5" }, parseWebSearchRequest(request()), { copilot: true, requestResponsesImpl: impl,
+  await assert.rejects(runWebSearch({ model: "claude-opus-5.5" }, parseWebSearchRequest(request()), { requestGptImpl: impl,
     listCopilotModels: async () => ["claude-opus-5.5"] }), /No Copilot GPT model/);
 });
 
@@ -124,12 +161,12 @@ test("a search beyond max_uses aborts upstream and is reported as max_uses_excee
   const control = { abort() { this.aborted = true; } };
   const { impl } = fakeResponses({ events: [added(0, "ws_1"), done(0, call("ws_1", [{ type: "url", url: "https://nodejs.org/" }])),
     added(1, "ws_2"), done(1, call("ws_2", [{ type: "url", url: "https://example.com/" }]))] });
-  const result = await runWebSearch({ model: "gpt-5.4" }, parseWebSearchRequest(request({ max_uses: 1 })), { control, requestResponsesImpl: impl });
+  const result = await runWebSearch({ model: "gpt-5.4" }, parseWebSearchRequest(request({ max_uses: 1 })), { control, requestGptImpl: impl });
   assert.equal(control.aborted, true);
   assert.equal(result.capped, true);
   assert.deepEqual(result.content.map((block) => block.type), ["server_tool_use", "web_search_tool_result", "server_tool_use", "web_search_tool_result"]);
   assert.deepEqual(result.content[3].content, { type: "web_search_tool_result_error", error_code: "max_uses_exceeded" });
   assert.equal(result.hits, 1);
   const failing = async () => { throw Object.assign(new Error("upstream down"), { status: 503 }); };
-  await assert.rejects(runWebSearch({ model: "gpt-5.4" }, parseWebSearchRequest(request()), { requestResponsesImpl: failing }), /upstream down/);
+  await assert.rejects(runWebSearch({ model: "gpt-5.4" }, parseWebSearchRequest(request()), { requestGptImpl: failing }), /upstream down/);
 });

@@ -8,15 +8,32 @@ const http = require("http");
 const { createRequire } = require("module");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
-const responses = require("../lib/openai-responses");
 const webSearch = require("../lib/web-search");
 
 const skip = process.env.RUN_CLAUDE_CLI_TESTS !== "1";
-const usage = { prompt_tokens: 20, completion_tokens: 2, cached_tokens: 10 };
+const usage = { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 10 };
+
+async function replyGpt(body, options, content, stopReason = "end_turn", tokenUsage = usage) {
+  const blocks = typeof content === "string" ? [{ type: "text", text: content }] : content;
+  if (options.onEvent) {
+    for (const [contentIndex, block] of blocks.entries()) {
+      if (block.type === "tool_use") {
+        await options.onEvent({ type: "toolcall_end", contentIndex,
+          toolCall: { id: `${block.id}|fixture_item`, name: block.name, arguments: block.input } });
+      } else {
+        await options.onEvent({ type: "text_start", contentIndex });
+        await options.onEvent({ type: "text_delta", contentIndex, delta: block.text });
+        await options.onEvent({ type: "text_end", contentIndex, content: block.text });
+      }
+    }
+  }
+  return { id: "msg_fixture", type: "message", role: "assistant", model: `anthropic/${body.model}`,
+    content: blocks, stop_reason: stopReason, stop_sequence: null, usage: tokenUsage };
+}
 
 // Runs the real proxy on a random loopback port and the installed CLI against it, with fake
 // upstreams for the conversation and for built-in web search. No real upstream requests or auth files.
-async function runCli({ requestResponses, searchResponses = async () => { throw new Error("unexpected web search"); }, envOverrides = {}, followUpPrompts = [] }, args) {
+async function runCli({ requestGpt, searchResponses = async () => { throw new Error("unexpected web search"); }, envOverrides = {}, followUpPrompts = [] }, args) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-cli-test-"));
   fs.writeFileSync(path.join(directory, "fixture.txt"), "compaction-fixture-marker");
   const filename = path.resolve("mac/proxy.js");
@@ -36,9 +53,9 @@ async function runCli({ requestResponses, searchResponses = async () => { throw 
       : name === "../lib/online-summary" ? { ...observations,
         createOnlineSummary: (options) => observations.createOnlineSummary({ ...options, configFile: path.join(directory, "features.json"), archiveRoot: path.join(directory, "observations") }),
         createSummarySettings: (options) => observations.createSummarySettings({ ...options, configFile: path.join(directory, "features.json") }) }
-      : name === "../lib/openai-responses" ? { ...responses, requestResponses }
-      : name === "../lib/web-search" ? { ...webSearch, runWebSearch: (body, search, options) => webSearch.runWebSearch(body, search, { ...options, requestResponsesImpl: searchResponses }) }
-        : name === "../lib/model-discovery" ? { createModelDiscovery: () => async () => ({ object: "list", data: [{ id: "gpt-5.4", owned_by: "openai" }] }) } : name === "../lib/macos-service" ? { createMacosService: () => ({ getStatus: async () => ({ supported: false }) }) } : name === "../lib/project-memory-install" ? { createProjectMemoryInstaller: () => ({ getStatus: async () => ({ state: "unavailable" }) }) } : nativeRequire(name),
+      : name === "../lib/pi-model" ? { requestPiModel: requestGpt }
+      : name === "../lib/web-search" ? { ...webSearch, runWebSearch: (body, search, options) => webSearch.runWebSearch(body, search, { ...options, requestGptImpl: searchResponses }) }
+        : name === "../lib/model-discovery" ? { createModelDiscovery: () => async () => ({ object: "list", data: [{ id: "gpt-5.4", owned_by: "openai", api: "openai-responses" }] }) } : name === "../lib/macos-service" ? { createMacosService: () => ({ getStatus: async () => ({ supported: false }) }) } : name === "../lib/project-memory-install" ? { createProjectMemoryInstaller: () => ({ getStatus: async () => ({ state: "unavailable" }) }) } : nativeRequire(name),
     __filename: filename, __dirname: path.dirname(filename), process, Buffer, URL,
     console: { log() {}, warn() {}, error() {} }, setTimeout, clearTimeout, setInterval, clearInterval
   };
@@ -95,12 +112,10 @@ async function runCli({ requestResponses, searchResponses = async () => { throw 
 // Opt in when Claude Code is installed.
 test("installed Claude CLI sends selected GPT and gateway serves discovery URL", { skip, timeout: 60000 }, async () => {
   const observed = [];
-  const { result, models } = await runCli({ requestResponses: async (body, options) => {
+  const { result, models } = await runCli({ requestGpt: async (body, options) => {
     observed.push(body.model);
     assert.equal(body.model, "gpt-5.4");
-    await options.onChunk({ choices: [{ delta: { content: "gateway-smoke-ok" } }] });
-    await options.onChunk({ choices: [{ delta: {}, finish_reason: "stop" }], usage });
-    return { streamed: true };
+    return replyGpt(body, options, "gateway-smoke-ok");
   } }, ["--bare", "--tools", "", "--system-prompt", "Reply only gateway-smoke-ok", "-p", "Test"]);
   assert.equal(result.is_error, false);
   assert.equal(result.result, "gateway-smoke-ok");
@@ -114,18 +129,14 @@ test("installed Claude CLI gets real links from built-in WebSearch through the g
   const conversation = [];
   const searches = [];
   const { result } = await runCli({
-    requestResponses: async (body, options) => {
+    requestGpt: async (body, options) => {
       conversation.push(body);
       if (conversation.length === 1) {
-        assert.ok(body.tools.some((tool) => tool.function.name === "WebSearch"));
-        await options.onChunk({ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_search",
-          function: { name: "WebSearch", arguments: JSON.stringify({ query: "gateway fixture query" }) } }] } }] });
-        await options.onChunk({ choices: [{ delta: {}, finish_reason: "tool_calls" }], usage });
-      } else {
-        await options.onChunk({ choices: [{ delta: { content: "search-done" } }] });
-        await options.onChunk({ choices: [{ delta: {}, finish_reason: "stop" }], usage });
+        assert.ok(body.tools.some((tool) => tool.name === "WebSearch"));
+        return replyGpt(body, options, [{ type: "tool_use", id: "call_search", name: "WebSearch",
+          input: { query: "gateway fixture query" } }], "tool_use");
       }
-      return { streamed: true };
+      return replyGpt(body, options, "search-done");
     },
     searchResponses: async (body, options) => {
       const payload = { model: body.model, include: [] };
@@ -133,11 +144,11 @@ test("installed Claude CLI gets real links from built-in WebSearch through the g
       searches.push({ body, payload });
       const call = { type: "web_search_call", id: "ws_fixture", status: "completed",
         action: { type: "search", queries: ["gateway fixture query"], sources: [{ type: "url", url: "https://fixture.example/result" }] } };
-      options.onEvent({ type: "response.output_item.added", output_index: 0, item: { type: "web_search_call", id: "ws_fixture", status: "in_progress" } });
-      options.onEvent({ type: "response.output_item.done", output_index: 0, item: call });
-      options.onEvent({ type: "response.output_item.done", output_index: 1, item: { type: "message", content: [{ type: "output_text", text: "Fixture summary.",
+      options.onProviderEvent({ type: "response.output_item.added", output_index: 0, item: { type: "web_search_call", id: "ws_fixture", status: "in_progress" } });
+      options.onProviderEvent({ type: "response.output_item.done", output_index: 0, item: call });
+      options.onProviderEvent({ type: "response.output_item.done", output_index: 1, item: { type: "message", content: [{ type: "output_text", text: "Fixture summary.",
         annotations: [{ type: "url_citation", url: "https://fixture.example/result?utm_source=openai", title: "Fixture Result Title" }] }] } });
-      options.onEvent({ type: "response.completed", response: { status: "completed", output: [] } });
+      options.onProviderEvent({ type: "response.completed", response: { status: "completed", output: [] } });
       return { usage };
     }
   }, ["--tools", "WebSearch", "--allowedTools", "WebSearch", "-p", "Search the web for gateway fixture query"]);
@@ -147,7 +158,8 @@ test("installed Claude CLI gets real links from built-in WebSearch through the g
   assert.equal(searches[0].body.model, "gpt-5.4");
   assert.equal(searches[0].payload.tools[0].type, "web_search");
   assert.equal(searches[0].payload.tool_choice, "required");
-  const output = conversation[1].messages.find((message) => message.role === "tool" && message.tool_call_id === "call_search").content;
+  const output = JSON.stringify(conversation[1].messages.flatMap((message) => Array.isArray(message.content) ? message.content : [])
+    .find((block) => block.type === "tool_result" && block.tool_use_id === "call_search").content);
   assert.match(output, /Fixture Result Title/);
   assert.match(output, /https:\/\/fixture\.example\/result/);
 });
@@ -165,9 +177,8 @@ for (const mode of ["threshold", "context-error", "oversized-summary"]) {
     const { result } = await runCli({
       // Claude Code compacts an anthropic/gpt-* model at its threshold only when this window is declared.
       envOverrides: { CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: mode === "context-error" ? "95" : "10", CLAUDE_CODE_MAX_CONTEXT_TOKENS: "200000" },
-      requestResponses: async (body, options) => {
-        const summary = body.messages.some((message) =>
-          typeof message.content === "string" && message.content.includes("Your task is to create a detailed summary of the conversation so far"));
+      requestGpt: async (body, options) => {
+        const summary = JSON.stringify([body.system, body.messages]).includes("Your task is to create a detailed summary of the conversation so far");
         observed.push({ messages: body.messages.length, bytes: Buffer.byteLength(JSON.stringify(body.messages)), summary });
         if (summary) {
           compactions++;
@@ -177,27 +188,17 @@ for (const mode of ["threshold", "context-error", "oversized-summary"]) {
             if (bytes >= rejectedSummaryBytes) throw tooLong();
           }
           const content = "The user asks to read fixture.txt and finish. The file contains compaction-fixture-marker. Continue and answer compact-resumed-ok.";
-          if (!body.stream) return { content, finish_reason: "stop", usage };
-          await options.onChunk({ choices: [{ delta: { content } }] });
-          await options.onChunk({ choices: [{ delta: {}, finish_reason: "stop" }], usage });
-          return { streamed: true };
+          return replyGpt(body, options, content);
         }
         ordinary++;
         if (mode === "context-error" && ordinary >= 2 && compactions === 0) throw tooLong();
         if (ordinary === 1) {
-          await options.onChunk({ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_fixture", function: {
-            name: "Read", arguments: JSON.stringify({ file_path: "fixture.txt" })
-          } }] } }] });
-          await options.onChunk({ choices: [{ delta: {}, finish_reason: "tool_calls" }],
-            usage: mode === "context-error" ? usage : { prompt_tokens: 190000, completion_tokens: 10, cached_tokens: 180000 } });
-        } else {
-          resumed = compactions > 0;
-          assert.ok(JSON.stringify(body.messages).includes("compaction-fixture-marker"), "resume must preserve the summary's known fact");
-          if (!body.stream) return { content: "compact-resumed-ok", finish_reason: "stop", usage };
-          await options.onChunk({ choices: [{ delta: { content: "compact-resumed-ok" } }] });
-          await options.onChunk({ choices: [{ delta: {}, finish_reason: "stop" }], usage });
+          return replyGpt(body, options, [{ type: "tool_use", id: "call_fixture", name: "Read", input: { file_path: "fixture.txt" } }],
+            "tool_use", mode === "context-error" ? usage : { input_tokens: 10000, output_tokens: 10, cache_read_input_tokens: 180000 });
         }
-        return { streamed: true };
+        resumed = compactions > 0;
+        assert.ok(JSON.stringify(body.messages).includes("compaction-fixture-marker"), "resume must preserve the summary's known fact");
+        return replyGpt(body, options, "compact-resumed-ok");
       }
     }, ["--tools", "Read", "--allowedTools", "Read", "--max-turns", "8", "--system-prompt", "Use Read to inspect fixture.txt, then finish.", "-p", "Read fixture.txt then answer compact-resumed-ok."]);
     assert.equal(result.is_error, false, JSON.stringify(result));
@@ -218,8 +219,8 @@ for (const mode of ["threshold", "context-error", "oversized-summary"]) {
 // A local Anthropic endpoint serves the catalog and stands in for the gateway, so every turn stays offline.
 test("launcher applies a fixed GPT window across GPT/Claude switching; compaction runs on the next turn", { skip, timeout: 200000 }, async () => {
   const summaryMarker = "Your task is to create a detailed summary of the conversation so far";
-  const catalog = { object: "list", data: [{ id: "anthropic/gpt-6.1-sol", context_window: 872000 },
-    { id: "claude-opus-5.5", context_window: 1000000 }] };
+  const catalog = { object: "list", data: [{ id: "anthropic/gpt-6.1-sol", owned_by: "openai", api: "openai-responses", context_window: 872000 },
+    { id: "claude-opus-5.5", owned_by: "github-copilot", api: "anthropic-messages", context_window: 1000000 }] };
   let inputTokens = 1000;
   const requests = [];
   const server = http.createServer((request, response) => {
@@ -329,7 +330,7 @@ test("installed CLI manual compact recovers from oversized summary input and res
   const { upstreamError } = require("../lib/upstream-error");
   const { result, followUps } = await runCli({
     followUpPrompts: ["/compact", "What fixture fact did we keep?"],
-    requestResponses: async (body, options) => {
+    requestGpt: async (body, options) => {
       const serialized = JSON.stringify(body.messages);
       const summary = serialized.includes("Your task is to create a detailed summary of the conversation so far");
       let content;
@@ -344,10 +345,7 @@ test("installed CLI manual compact recovers from oversized summary input and res
         resumedWithFact ||= summaries > 0 && serialized.includes("manual-compact-marker");
         content = summaries > 0 ? "manual-compact-marker" : "Recorded fixture fact: manual-compact-marker.";
       }
-      if (!body.stream) return { content, finish_reason: "stop", usage };
-      await options.onChunk({ choices: [{ delta: { content } }] });
-      await options.onChunk({ choices: [{ delta: {}, finish_reason: "stop" }], usage });
-      return { streamed: true };
+      return replyGpt(body, options, content);
     }
   }, ["--bare", "--tools", "", "--system-prompt", "Remember synthetic fixture facts.", "-p", "Remember the fixture fact manual-compact-marker."]);
   assert.equal(result.is_error, false);

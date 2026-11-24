@@ -135,9 +135,9 @@
     </section>
 
     <section id="hud-card" class="card" aria-labelledby="hud-heading" hidden>
-      <h2 id="hud-heading">Claude HUD</h2>
-      <p>Install claude-hud using Claude CLI. After installation, run /reload-plugins and /hud in Claude Code to finish setup.</p>
-      <label class="toggle" for="hud-install"><input id="hud-install" type="checkbox" disabled> Install claude-hud</label>
+      <h2 id="hud-heading">Configure Claude HUD</h2>
+      <p>Turn on to install and enable claude-hud using Claude CLI. Run /reload-plugins and /hud in Claude Code to finish setup. Turning it off disables the plugin and removes only its HUD statusLine command; plugin files are kept.</p>
+      <label class="toggle" for="hud-install"><input id="hud-install" type="checkbox" disabled> Enable claude-hud</label>
       <p id="hud-status" class="status" role="status" aria-live="polite">Checking Claude CLI…</p>
     </section>
 
@@ -492,25 +492,30 @@
 
     let hudBusy = false;
     let hudMessage = null;
+    let lastHud = null;
     function renderHudStatus(status) {
+      lastHud = status;
       const toggle = document.getElementById("hud-install");
-      toggle.disabled = hudBusy || !status.ready || status.installed === true;
       if (hudBusy) return;
-      toggle.checked = status.installed === true;
+      toggle.disabled = hudBusy || (!status.enabled && !status.ready);
+      toggle.checked = status.enabled === true;
       setMessage(document.getElementById("hud-status"), hudMessage || status.reason ||
-        (status.installed ? "Claude HUD installed. Run /reload-plugins, then /hud in Claude Code." : "Check the box to install claude-hud."));
+        (status.enabled ? "On. Run /reload-plugins, then /hud in Claude Code to finish setup." : "Off."));
     }
     async function installHud() {
       const toggle = document.getElementById("hud-install");
-      if (hudBusy || toggle.disabled || !toggle.checked) return;
+      if (hudBusy) return;
+      if (toggle.disabled) { toggle.checked = lastHud?.enabled === true; return; }
+      const wanted = toggle.checked;
       hudBusy = true;
       toggle.disabled = true;
-      setMessage(document.getElementById("hud-status"), "Installing claude-hud…");
+      hudMessage = null;
+      setMessage(document.getElementById("hud-status"), wanted ? "Enabling claude-hud…" : "Disabling claude-hud…");
       try {
-        const result = await apiRequest("/api/auth/statusline/configure", { method: "POST", body: "{}", timeoutMs: 200000 });
-        if (result.success !== true) throw new Error("Claude HUD installation failed.");
-        hudMessage = result.message || "Claude HUD installed. Run /reload-plugins, then /hud in Claude Code.";
-      } catch (error) { hudMessage = error.message || "Claude HUD installation failed."; }
+        const result = await apiRequest("/api/auth/statusline/configure", { method: "POST", body: JSON.stringify({ enabled: wanted }), timeoutMs: 200000 });
+        if (result.success !== true || result.enabled !== wanted) throw new Error("Claude HUD could not be configured.");
+        hudMessage = result.message || (wanted ? "Claude HUD is on. Run /reload-plugins, then /hud in Claude Code." : "Claude HUD is off. Plugin files are kept.");
+      } catch (error) { hudMessage = error.message || "Claude HUD could not be configured."; toggle.checked = lastHud?.enabled === true; }
       finally { hudBusy = false; await refreshStatus(); }
     }
 

@@ -50,7 +50,7 @@ function startProxy(platform, root, { installer, installerFactory, listen = "suc
   const logs = [];
   const warns = [];
   const calls = { factory: 0, autoEnable: 0, listening: false, autoEnableBeforeListen: 0,
-    setupFactory: 0, syncGpt: 0, syncBeforeListen: 0, syncCapacity: 0, capacityBeforeListen: 0,
+    setupFactory: 0, syncCapacity: 0, capacityBeforeListen: 0,
     models: [], gptModels: [], invalidations: 0, gptInvalidations: 0 };
   const store = { directory: path.join(root, "store"), migrate() {}, readAuth: () => auth };
   const getAvailableModels = Object.assign((options) => {
@@ -102,13 +102,6 @@ function startProxy(platform, root, { installer, installerFactory, listen = "suc
           calls.setupFactory++;
           const setup = nativeRequire(name).createClaudeSetup({ ...options, configRoot, env: {}, store, getAvailableModels,
             probe: async () => ({ cli: true }) });
-          const synchronize = setup.syncGptSubagentModel;
-          setup.syncGptSubagentModel = () => {
-            calls.syncGpt++;
-            if (!calls.listening) calls.syncBeforeListen++;
-            calls.syncPending = synchronize();
-            return calls.syncPending;
-          };
           const synchronizeCapacity = setup.syncGptContextCapacity;
           setup.syncGptContextCapacity = () => {
             calls.syncCapacity++;
@@ -144,21 +137,24 @@ for (const platform of ["mac", "windows"]) {
       model: "personal-model", permissions: { allow: ["Read"] } };
     fs.writeFileSync(settings, JSON.stringify(original));
     const options = { auth: { openai: { type: "api_key", key: "test-key" } },
-      catalog: async () => ({ data: [{ id: "gpt-main", context_window: 400000 }] }),
-      gptCatalog: async () => ({ data: [{ id: "gpt-small", context_window: 400000 },
-        { id: "gpt-largest", max_context_window: 1200000 }, { id: "claude-test", context_window: 2000000 }] }) };
+      catalog: async () => ({ data: [{ id: "gpt-main", owned_by: "openai", api: "openai-responses", context_window: 400000 }] }),
+      gptCatalog: async () => ({ data: [{ id: "gpt-small", owned_by: "openai", api: "openai-responses", context_window: 400000 },
+        { id: "gpt-largest", owned_by: "openai", api: "openai-responses", max_context_window: 1200000 }, { id: "claude-test", owned_by: "github-copilot", api: "anthropic-messages", context_window: 2000000 }] }) };
     const first = startProxy(platform, root, { ...options, listen: "manual" });
+    assert.equal(first.calls.setupFactory, 1);
+    assert.equal(first.calls.authSetup, first.calls.setup);
     assert.equal(first.calls.syncCapacity, 0);
     assert.deepEqual(first.calls.gptModels, []);
     assert.deepEqual(JSON.parse(fs.readFileSync(settings)), original);
     first.server.listenCallback();
-    await Promise.all([first.calls.syncPending, first.calls.capacityPending]);
+    await first.calls.capacityPending;
     const saved = JSON.parse(fs.readFileSync(settings));
     assert.equal(first.calls.syncCapacity, 1);
     assert.equal(first.calls.capacityBeforeListen, 0);
     assert.deepEqual(first.calls.gptModels, [{ waitForRefresh: true }]);
     assert.equal(saved.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "1200000");
-    assert.equal(saved.env.CLAUDE_CODE_SUBAGENT_MODEL, "anthropic/gpt-main");
+    assert.equal(saved.env.CLAUDE_CODE_SUBAGENT_MODEL, undefined);
+    assert.equal(saved.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE, undefined);
     for (const key of ["KEEP", "ANTHROPIC_MODEL"]) assert.equal(saved.env[key], original.env[key]);
     assert.equal(saved.model, original.model);
     assert.deepEqual(saved.permissions, original.permissions);
@@ -167,7 +163,7 @@ for (const platform of ["mac", "windows"]) {
     const backups = path.join(configRoot, "claude-proxy", "settings-backups");
     const names = fs.readdirSync(backups);
     const second = startProxy(platform, root, options);
-    await Promise.all([second.calls.syncPending, second.calls.capacityPending]);
+    await second.calls.capacityPending;
     assert.equal(second.calls.syncCapacity, 1);
     assert.deepEqual(second.calls.gptModels, [{ waitForRefresh: true }]);
     assert.deepEqual(fs.readFileSync(settings), bytes);
@@ -192,26 +188,26 @@ for (const platform of ["mac", "windows"]) {
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     fs.mkdirSync(path.join(root, "config"));
     const settings = path.join(root, "config", "settings.json");
-    const original = '{ "env": { "CLAUDE_CODE_SUBAGENT_MODEL": "anthropic/gpt-test", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1", "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "123456" } }\n';
+    const original = '{ "env": { "CLAUDE_CODE_SUBAGENT_MODEL": "opus", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "0", "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "123456" } }\n';
     fs.writeFileSync(settings, original);
     let attempts = 0;
-    const options = { auth: { openai: { type: "api_key", key: "test-key" } },
-      catalog: async () => ({ data: [{ id: "gpt-test" }] }), gptCatalog: async () => {
+    const options = { auth: { openai: { type: "api_key", key: "test-key" } }, gptCatalog: async () => {
         if (++attempts === 1) throw new Error("private-token /private/credential/path");
-        return { data: [{ id: "gpt-test", context_window: 872000 }] };
+        return { data: [{ id: "gpt-test", owned_by: "openai", api: "openai-responses", context_window: 872000 }] };
       } };
     const failed = startProxy(platform, root, options);
     await assert.rejects(failed.calls.capacityPending);
-    await failed.calls.syncPending;
     await tick();
     assert.equal(fs.readFileSync(settings, "utf8"), original);
     assert.equal(failed.warns.filter((line) => line.includes("GPT context capacity sync failed")).length, 1);
     assert.doesNotMatch([...failed.logs, ...failed.warns].join("\n"), /private-token|\/private\/credential/);
     assert.equal(failed.fakeProcess.exitCode, undefined);
     const retried = startProxy(platform, root, options);
-    await Promise.all([retried.calls.syncPending, retried.calls.capacityPending]);
+    await retried.calls.capacityPending;
     assert.equal(attempts, 2);
-    assert.equal(JSON.parse(fs.readFileSync(settings)).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "872000");
+    assert.deepEqual(JSON.parse(fs.readFileSync(settings)).env, {
+      ...JSON.parse(original).env, CLAUDE_CODE_MAX_CONTEXT_TOKENS: "872000"
+    });
   });
 
   test(`${platform} pending startup capacity discovery never blocks listening and skips saving after logout`, async (t) => {
@@ -226,7 +222,7 @@ for (const platform of ["mac", "windows"]) {
     assert.ok(run.logs.some((line) => line.includes("claude-proxy running")));
     assert.equal(run.fakeProcess.exitCode, undefined);
     delete auth.openai;
-    complete({ data: [{ id: "gpt-test", context_window: 872000 }] });
+    complete({ data: [{ id: "gpt-test", owned_by: "openai", api: "openai-responses", context_window: 872000 }] });
     assert.equal((await run.calls.capacityPending).skipped, true);
     assert.equal(fs.existsSync(path.join(run.configRoot, "settings.json")), false);
   });
@@ -238,10 +234,9 @@ for (const platform of ["mac", "windows"]) {
       const auth = {};
       const run = startProxy(platform, root, { auth, gptCatalog: async (options) => {
         assert.deepEqual(options, { waitForRefresh: true });
-        return { data: [{ id: "gpt-small", context_window: 400000 },
-          { id: "anthropic/gpt-largest", max_context_window: 1200000 }, { id: "claude-test", context_window: 2000000 }] };
+        return { data: [{ id: "gpt-small", owned_by: "openai", api: "openai-responses", context_window: 400000 },
+          { id: "anthropic/gpt-largest", owned_by: "openai", api: "openai-responses", max_context_window: 1200000 }, { id: "claude-test", owned_by: "github-copilot", api: "anthropic-messages", context_window: 2000000 }] };
       } });
-      await run.calls.syncPending;
       const settings = path.join(run.configRoot, "settings.json");
       const original = { env: { KEEP: "yes", CLAUDE_CODE_MAX_CONTEXT_TOKENS: "123456" }, model: "personal-model" };
       fs.writeFileSync(settings, JSON.stringify(original));
@@ -266,7 +261,6 @@ for (const platform of ["mac", "windows"]) {
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const auth = {};
     const run = startProxy(platform, root, { auth });
-    await run.calls.syncPending;
     const settings = path.join(run.configRoot, "settings.json");
     const original = '{ "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "123456" } }\n';
     fs.writeFileSync(settings, original);
@@ -285,7 +279,6 @@ for (const platform of ["mac", "windows"]) {
     const run = startProxy(platform, root, { auth, gptCatalog: async () => {
       throw new Error("secret-access-token /private/credential/path");
     } });
-    await run.calls.syncPending;
     const settings = path.join(run.configRoot, "settings.json");
     const original = '{ "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "123456" } }\n';
     fs.writeFileSync(settings, original);
@@ -323,7 +316,7 @@ for (const platform of ["mac", "windows"]) {
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const auth = {};
     const run = startProxy(platform, root, { auth,
-      catalog: async () => ({ data: [{ id: "gpt-sol-test", context_window: 872000 }] }),
+      catalog: async () => ({ data: [{ id: "gpt-sol-test", owned_by: "openai", api: "openai-responses", context_window: 872000 }] }),
       installer: () => auth.openai ? { ok: true, enabled: true, state: "installed" } : null });
     await tick();
     assert.equal(run.calls.autoEnable, 1);
@@ -367,28 +360,6 @@ for (const platform of ["mac", "windows"]) {
 }
 
 for (const platform of ["mac", "windows"]) {
-  const auth = () => ({ openai: { type: "api_key", key: "test-startup-key" } });
-  const catalog = async () => ({ data: [{ id: "gpt-startup-test" }] });
-
-  test(`${platform} startup uses one shared setup and syncs GPT only after successful listen`, async (t) => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-startup-"));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const run = startProxy(platform, root, { listen: "manual", auth: auth(), catalog });
-    assert.equal(run.calls.setupFactory, 1);
-    assert.equal(run.calls.authSetup, run.calls.setup);
-    assert.equal(run.calls.syncGpt, 0);
-    run.server.listenCallback();
-    assert.equal(run.calls.syncGpt, 1);
-    assert.equal(run.calls.syncBeforeListen, 0);
-    assert.equal((await run.calls.syncPending).model, "anthropic/gpt-startup-test");
-    assert.equal(run.calls.models.filter((options) => options?.waitForRefresh === true).length, 1);
-    const failedRoot = path.join(root, "failed");
-    const failed = startProxy(platform, failedRoot, { listen: "error", auth: auth(), catalog });
-    await tick();
-    assert.equal(failed.calls.syncGpt, 0);
-    assert.equal(fs.existsSync(path.join(failed.configRoot, "settings.json")), false);
-  });
-
   test(`${platform} startup without GPT credentials preserves old settings and does not create new ones`, async (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-startup-"));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -399,8 +370,7 @@ for (const platform of ["mac", "windows"]) {
       const settings = path.join(configRoot, "settings.json");
       const original = '{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"anthropic/gpt-old","CLAUDE_CODE_SUBAGENT_MODEL_FORCE":"1"},"keep":true}\n';
       if (existing) fs.writeFileSync(settings, original);
-      const run = startProxy(platform, directory, { catalog });
-      assert.equal((await run.calls.syncPending).skipped, true);
+      const run = startProxy(platform, directory);
       assert.equal((await run.calls.capacityPending).skipped, true);
       assert.deepEqual(run.calls.gptModels, []);
       if (existing) assert.equal(fs.readFileSync(settings, "utf8"), original);
@@ -408,95 +378,6 @@ for (const platform of ["mac", "windows"]) {
       assert.equal(run.calls.models.some((options) => options?.waitForRefresh), false);
       assert.equal(fs.existsSync(path.join(configRoot, "claude-proxy", "settings-backups")), false);
     }
-  });
-
-  test(`${platform} repeated startup selects dynamic GPT once and leaves identical settings and backups untouched`, async (t) => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-startup-"));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const configRoot = path.join(root, "config");
-    fs.mkdirSync(configRoot);
-    const settings = path.join(configRoot, "settings.json");
-    const original = '{"env":{"KEEP":"yes","ANTHROPIC_MODEL":"claude-sonnet-test"},"model":"personal-model","permissions":{"allow":[]}}\n';
-    fs.writeFileSync(settings, original);
-    const first = startProxy(platform, root, { auth: auth(), catalog });
-    await first.calls.syncPending;
-    const bytes = fs.readFileSync(settings);
-    const current = JSON.parse(bytes);
-    assert.deepEqual(current.env, { KEEP: "yes", ANTHROPIC_MODEL: "claude-sonnet-test",
-      CLAUDE_CODE_SUBAGENT_MODEL: "anthropic/gpt-startup-test", CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "1" });
-    assert.equal(current.model, "personal-model");
-    assert.deepEqual(current.permissions, { allow: [] });
-    const backups = path.join(configRoot, "claude-proxy", "settings-backups");
-    const names = fs.readdirSync(backups);
-    assert.equal(names.length, 1);
-    assert.equal(fs.readFileSync(path.join(backups, names[0]), "utf8"), original);
-    const modified = fs.statSync(settings).mtimeMs;
-    const second = startProxy(platform, root, { auth: auth(), catalog });
-    await second.calls.syncPending;
-    assert.equal(first.calls.syncGpt, 1);
-    assert.equal(second.calls.syncGpt, 1);
-    assert.deepEqual(fs.readFileSync(settings), bytes);
-    assert.equal(fs.statSync(settings).mtimeMs, modified);
-    assert.deepEqual(fs.readdirSync(backups), names);
-  });
-
-  test(`${platform} startup without an available GPT keeps existing defaults and warns safely`, async (t) => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-startup-"));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const configRoot = path.join(root, "config");
-    fs.mkdirSync(configRoot);
-    const settings = path.join(configRoot, "settings.json");
-    const original = '{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"anthropic/gpt-old","CLAUDE_CODE_SUBAGENT_MODEL_FORCE":"1"}}\n';
-    fs.writeFileSync(settings, original);
-    const run = startProxy(platform, root, { auth: auth(), catalog: async () => ({ data: [{ id: "claude-sonnet-test" }] }) });
-    await assert.rejects(run.calls.syncPending);
-    await tick();
-    assert.equal(fs.readFileSync(settings, "utf8"), original);
-    assert.equal(fs.existsSync(path.join(configRoot, "claude-proxy", "settings-backups")), false);
-    assert.equal(run.warns.filter((line) => line.includes("GPT subagent")).length, 1);
-  });
-
-  test(`${platform} credentials disappearing during startup refresh skip without overwriting settings`, async (t) => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-startup-"));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const configRoot = path.join(root, "config");
-    fs.mkdirSync(configRoot);
-    const settings = path.join(configRoot, "settings.json");
-    const original = '{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"anthropic/gpt-old"}}\n';
-    fs.writeFileSync(settings, original);
-    const credentials = auth();
-    let complete;
-    const pending = new Promise((resolve) => { complete = resolve; });
-    const run = startProxy(platform, root, { auth: credentials,
-      catalog: (options) => options?.waitForRefresh ? pending : catalog() });
-    await tick();
-    assert.ok(run.calls.models.some((options) => options?.waitForRefresh));
-    delete credentials.openai;
-    complete(await catalog());
-    assert.equal((await run.calls.syncPending).skipped, true);
-    assert.equal(fs.readFileSync(settings, "utf8"), original);
-    assert.equal(fs.existsSync(path.join(configRoot, "claude-proxy", "settings-backups")), false);
-  });
-
-  test(`${platform} pending or failing GPT sync never blocks listening and logs only a safe warning`, async (t) => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-startup-"));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const pending = startProxy(platform, path.join(root, "pending"), { auth: auth(),
-      catalog: (options) => options?.waitForRefresh ? new Promise(() => {}) : catalog() });
-    assert.ok(pending.logs.some((line) => line.includes("claude-proxy running")));
-    assert.equal(pending.fakeProcess.exitCode, undefined);
-    const failure = startProxy(platform, path.join(root, "failure"), { auth: auth(), catalog: async (options) => {
-      if (options?.waitForRefresh) throw new Error("secret-access-token secret-refresh-token /private/credential/path");
-      return catalog();
-    } });
-    await tick();
-    assert.equal(failure.calls.syncGpt, 1);
-    assert.ok(failure.logs.some((line) => line.includes("claude-proxy running")));
-    assert.equal(failure.fakeProcess.exitCode, undefined);
-    const warnings = failure.warns.filter((line) => line.includes("GPT subagent"));
-    assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /\[claude-setup\] WARN GPT subagent model sync failed; existing settings were kept\. Retry on next proxy startup\.$/);
-    assert.doesNotMatch([...failure.logs, ...failure.warns].join("\n"), /secret-access|secret-refresh|\/private\/credential/);
   });
 }
 

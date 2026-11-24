@@ -8,6 +8,9 @@
 .env.*
 .claude/
 
+# Dependencies
+node_modules/
+
 # Temporary files and local output
 *.tmp
 *.temp

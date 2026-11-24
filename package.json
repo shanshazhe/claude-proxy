@@ -1,0 +1,9 @@
+{
+  "name": "claude-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local Anthropic Messages gateway with Codex and Copilot authentication",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": { "test": "node --test test/*.test.js" },
+  "dependencies": { "@earendil-works/pi-ai": "1.6.0", "openai": "7.59.0" }
+}

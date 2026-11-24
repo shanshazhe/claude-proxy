@@ -5,7 +5,8 @@ const path = require("path");
 const vm = require("vm");
 const http = require("http");
 const { createRequire } = require("module");
-const responses = require("../lib/openai-responses");
+const { requestGpt } = require("../lib/pi-gpt");
+const { jwt } = require("./helpers/pi-fixture");
 const { estimateInputTokens } = require("../lib/token-count");
 
 async function proxy(platform, callback) {
@@ -16,18 +17,16 @@ async function proxy(platform, callback) {
   const context = {
     require(name) {
       if (name === "http") return { createServer(handler) { server = http.createServer(handler); return server; } };
-      if (name === "../lib/openai-responses") return { ...responses, requestResponses(body, options) {
+      if (name === "../lib/pi-model") return { requestPiModel(body, options) {
         generations++;
-        return responses.requestResponses(body, { ...options,
-          loadAuth: async () => ({ kind: "codex", token: "fixture", accountId: "fixture" }),
-          fetchImpl: async () => ({ ok: true, body: (async function* () {
-            yield Buffer.from('event: error\ndata: ' + JSON.stringify({ type: "error", error: {
-              code: "context_length_exceeded", type: "invalid_request_error", message: "Your input exceeds the context window of this model."
-            } }) + '\n\n');
-          })() })
+        return requestGpt(body, { ...options,
+          loadAuth: async () => ({ kind: "codex", token: jwt("fixture-account"), accountId: "fixture-account" }),
+          fetchImpl: async () => new Response('event: error\ndata: ' + JSON.stringify({ type: "error", error: {
+            code: "context_length_exceeded", type: "invalid_request_error", message: "Your input exceeds the context window of this model."
+          } }) + '\n\n', { headers: { "Content-Type": "text/event-stream" } })
         });
       } };
-      if (name === "../lib/model-discovery") return { createModelDiscovery: () => async () => ({ object: "list", data: [] }) };
+      if (name === "../lib/model-discovery") return { createModelDiscovery: () => async () => ({ object: "list", data: [{ id: "gpt-5", owned_by: "openai", api: "openai-responses" }, { id: "gpt-5.4", owned_by: "openai", api: "openai-responses" }, { id: "gpt-6.1-sol", owned_by: "openai", api: "openai-responses" }, { id: "gpt-6-sol", owned_by: "openai", api: "openai-responses" }, { id: "claude-sonnet-5.5", owned_by: "github-copilot", api: "anthropic-messages" }, { id: "claude-opus-5.5", owned_by: "github-copilot", api: "anthropic-messages" }] }) };
       if (name === "../lib/macos-service") return { createMacosService: () => ({}) };
       if (name === "../lib/project-memory-install") return { createProjectMemoryInstaller: () => ({}) };
       return nativeRequire(name);

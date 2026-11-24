@@ -375,13 +375,30 @@ test("setup endpoints share loopback/Host/nonce/Origin/JSON/OPTIONS and bounded 
   assert.equal(writes, 3);
 });
 
+test("HUD configuration accepts only an enabled boolean on the guarded statusline route", async (t) => {
+  const changes = [];
+  const { api } = await fixture(t, { setup: { async configureStatusline(enabled) {
+    changes.push(enabled); return { success: true, enabled };
+  } } });
+  for (const enabled of [true, false]) {
+    const result = await api("/api/auth/statusline/configure", { method: "POST", body: JSON.stringify({ enabled }) });
+    assert.equal(result.status, 200);
+    assert.equal(JSON.parse(result.text).enabled, enabled);
+  }
+  for (const body of ['{"enabled":"true"}', '{"enabled":true,"command":"bad"}']) {
+    assert.equal((await api("/api/auth/statusline/configure", { method: "POST", body })).status, 400);
+  }
+  assert.equal((await api("/api/auth/claude/configure", { method: "POST", body: '{"enabled":false}' })).status, 400);
+  assert.deepEqual(changes, [true, false]);
+});
+
 test("HTTP setup rejects absent credentials, returns safe status and concurrently preserves both updates", async (t) => {
   let configRoot;
   let catalogs = 0;
   const { api, store } = await fixture(t, { env: {}, setupFactory: (store) => {
     configRoot = path.join(store.directory, "cli");
     return createClaudeSetup({ configRoot, store, env: {}, platform: "linux", probe: async () => ({ cli: true, bash: "/bin/bash", jq: "test-jq", node: process.execPath }),
-      getAvailableModels: async () => { catalogs++; return { data: [{ id: "gpt-test" }] }; },
+      getAvailableModels: async () => { catalogs++; return { data: [{ id: "gpt-test", owned_by: "openai", api: "openai-responses" }] }; },
       installer: { validateBundle() {}, deploy: () => ({ command: "local-statusline" }), cleanup() {}, isConfigured: (value) => value?.command === "local-statusline" } });
   } });
   const status = await api("/api/auth/status");
