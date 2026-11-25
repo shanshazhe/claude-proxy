@@ -362,7 +362,8 @@ test("Windows HUD checkbox stays editable when enabled and prevents duplicate ch
   let finish;
   const page = pageHarness(null, { status: () => ({ statusline: { kind: "claude-hud", ready: true, installed: true, enabled } }),
     configure: (_url, options) => new Promise((resolve) => { finish = () => {
-      enabled = JSON.parse(options.body).enabled; resolve(response({ success: true, enabled }));
+      enabled = JSON.parse(options.body).enabled;
+      resolve(response({ success: true, enabled, message: enabled ? "Statusline is on." : "Statusline is off." }));
     }; }) });
   await page.refresh();
   assert.equal(page.element("hud-card").hidden, false);
@@ -378,17 +379,24 @@ test("Windows HUD checkbox stays editable when enabled and prevents duplicate ch
   finish(); await installing;
   assert.equal(toggle.checked, true);
   assert.equal(toggle.disabled, false);
-  assert.match(page.element("hud-status").textContent, /\/reload-plugins.*\/hud/);
+  assert.equal(page.element("hud-status").textContent, "Statusline is on.");
   toggle.checked = false;
   const disabling = toggle.listeners.change();
   assert.equal(toggle.disabled, true);
+  assert.equal(page.element("hud-status").textContent, "Uninstalling Statusline…");
   finish(); await disabling;
   assert.equal(toggle.checked, false);
   assert.equal(toggle.disabled, false);
-  assert.match(page.element("hud-status").textContent, /off.*files are kept/);
+  assert.equal(page.element("hud-status").textContent, "Statusline is off.");
   const html = fs.readFileSync(path.join(__dirname, "../web/login.html"), "utf8");
   const card = html.match(/<section id="hud-card"[\s\S]*?<\/section>/)[0];
-  assert.doesNotMatch(card, /Bash|jq|ccusage|ccstatusline|Node\.js|Replaces|Configure Statusline/);
+  assert.match(card, /<h2 id="hud-heading">Configure Statusline<\/h2>/);
+  assert.match(card, /type="checkbox" disabled> Enable Statusline<\/label>/);
+  assert.match(card, /<p>Installs Claude HUD from its plugin marketplace and uses it as the statusline\. Requires Claude CLI; login is not required\.<\/p>/);
+  assert.doesNotMatch(card, /Bash|jq|ccusage|ccstatusline|Node\.js|Replaces|reload-plugins|config\.undo/);
+  const statusline = html.match(/<section id="statusline-card"[\s\S]*?<\/section>/)[0];
+  assert.match(statusline, /Replaces the current statusLine command, backing it up, and keeps unrelated plugins unchanged\. Requires Claude CLI, Bash 3\+, and jq 1\.6\+; login is not required\./);
+  assert.match(statusline, /<button id="statusline-configure" type="button" disabled>Configure Statusline<\/button>/);
 });
 
 test("HUD missing CLI disables its checkbox and install failures allow retry", async () => {

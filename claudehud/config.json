@@ -1,0 +1,26 @@
+{
+  "lineLayout": "compact",
+  "gitStatus": {
+    "enabled": true,
+    "showDirty": true
+  },
+  "elementOrder": [
+    "project",
+    "context",
+    "sessionTokens",
+    "cacheHitRate"
+  ],
+  "projectLineOrder": [
+    "project",
+    "model"
+  ],
+  "display": {
+    "showContextBar": false,
+    "contextValue": "both",
+    "showSessionTokens": true,
+    "showCacheHitRate": true,
+    "showProject": false,
+    "showEffortLevel": true,
+    "effortFormat": "full"
+  }
+}

@@ -119,7 +119,9 @@ test("GPT searches keep their model and recover items when the completed output 
   const { impl, seen } = fakeResponses({ events: [added(0, "ws_1"), done(0, call("ws_1", [{ type: "url", url: "https://nodejs.org/" }])),
     done(1, message("Summary.")), { type: "response.completed", response: { status: "completed", output: [] } }] });
   const body = request({ allowed_domains: ["nodejs.org"] }, { model: "gpt-6.1-sol", system: "search policy", max_tokens: 100 });
-  const result = await runWebSearch(body, parseWebSearchRequest(body), { requestGptImpl: impl });
+  const onReplayFailure = () => {};
+  const result = await runWebSearch(body, parseWebSearchRequest(body), { requestGptImpl: impl, onReplayFailure });
+  assert.equal(seen[0].options.onReplayFailure, onReplayFailure);
   assert.equal(seen[0].body.system, "search policy");
   assert.equal(seen[0].body.max_tokens, 100);
   assert.deepEqual(seen[0].body.messages, body.messages);

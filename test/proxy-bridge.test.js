@@ -206,7 +206,7 @@ for (const platform of ["mac", "windows"]) {
 }
 
 for (const platform of ["mac", "windows"]) {
-  test(`${platform} passes prepared Anthropic history, images and request controls directly to Pi`, async () => {
+  test(`${platform} passes split UTF-8 history, images and request controls intact to Pi`, async () => {
     const filename = path.resolve(platform, "proxy.js");
     const nativeRequire = createRequire(filename);
     let route;
@@ -237,7 +237,7 @@ for (const platform of ["mac", "windows"]) {
           { type: "tool_use", id: "call_a", name: "Bash", input: { command: "ls" } }] },
         { role: "system", content: "later reminder" },
         { role: "user", content: [{ type: "tool_result", tool_use_id: "call_a", is_error: true, content: [
-          { type: "text", text: "rejected" }, { type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } }] },
+          { type: "text", text: "读取结果" }, { type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } }] },
           { type: "text", text: "[Request interrupted by user for tool use]" }, { type: "text", text: "next request" }] }
       ] };
     const request = new EventEmitter();
@@ -246,7 +246,13 @@ for (const platform of ["mac", "windows"]) {
     response.setHeader = response.writeHead = () => {};
     const done = new Promise((resolve) => { response.end = resolve; });
     await route(request, response);
-    request.emit("data", Buffer.from(JSON.stringify(body)));
+    const bytes = Buffer.from(JSON.stringify(body));
+    const start = bytes.indexOf(Buffer.from("读"));
+    assert.ok(start > 0);
+    // Split one three-byte character across three data events.
+    request.emit("data", bytes.subarray(0, start + 1));
+    request.emit("data", bytes.subarray(start + 1, start + 2));
+    request.emit("data", bytes.subarray(start + 2));
     request.emit("end");
     const result = JSON.parse(await done);
     assert.equal(result.id, "msg_direct");
