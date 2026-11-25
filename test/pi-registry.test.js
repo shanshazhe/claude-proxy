@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const { loadPiModels, piModel, resolveGatewayModel } = require("../lib/pi-registry");
 const { requestPiModel } = require("../lib/pi-model");
 const { claudeSse } = require("./helpers/claude-fixture");
+const { eventsFor, jwt, payloadOf, sse } = require("./helpers/pi-fixture");
 
 const route = { id: "arbitrary-name", owned_by: "github-copilot", api: "anthropic-messages", context_window: 352001 };
 
@@ -20,6 +21,24 @@ test("routing follows catalog metadata, not names", async () => {
     }
   });
   assert.equal(result.content[0].text, "native reply");
+});
+
+test("Codex and Claude send the provider's full catalog ID, not the gateway display ID", async () => {
+  for (const [id, api, owned_by, auth] of [
+    ["openai/gpt-fixture", "openai-codex-responses", "openai", { kind: "codex", token: jwt("fixture"), accountId: "fixture" }],
+    ["anthropic/claude-fixture", "anthropic-messages", "github-copilot", { token: "fixture", baseUrl: "https://copilot.example" }]
+  ]) {
+    const route = { id, api, owned_by };
+    const model = await resolveGatewayModel(id.replace(/^anthropic\//, ""), async () => ({ data: [route] }));
+    assert.strictEqual(model, route);
+    await requestPiModel({ model: id.replace(/^anthropic\//, ""), messages: [{ role: "user", content: "hi" }] }, {
+      route: model, loadAuth: async () => auth, remember: false,
+      fetchImpl: async (_, options) => {
+        assert.equal(payloadOf(options).model, id);
+        return owned_by === "openai" ? sse(eventsFor()) : claudeSse();
+      }
+    });
+  }
 });
 
 test("live context metadata overrides Pi's bundled capacity", async () => {

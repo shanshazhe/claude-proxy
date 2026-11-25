@@ -1,12 +1,12 @@
 const http = require("http");
 const { countTokens, getModelCapabilities } = require("../lib/pi-capabilities");
-const { resolveGatewayModel } = require("../lib/pi-registry");
+const { getGatewayModel, resolveGatewayModel } = require("../lib/pi-registry");
 const { isReplayCarrier } = require("../lib/responses-replay");
 const fs = require("fs");
 const path = require("path");
 
 const { requestPiModel } = require("../lib/pi-model");
-const { selectModel, toGatewayModelId, toGatewayModels } = require("../lib/model-routing");
+const { selectModel, catalogModelId, toGatewayModels } = require("../lib/model-routing");
 const { createModelDiscovery } = require("../lib/model-discovery");
 const { parseWebSearchRequest, runWebSearch, toAnthropicMessage, toAnthropicEvents } = require("../lib/web-search");
 const { createOnlineSummary, createSummarySettings } = require("../lib/online-summary");
@@ -273,14 +273,15 @@ async function writeSseEvent(res, eventName, data) {
 
 // 项目记忆调用的后续请求由代理直接结束这一轮；用量按请求体字节估算，避免客户端的上下文统计归零。
 async function sendLocalMessage(res, body, text, requestBytes, requestId) {
-  const model = selectModel(body.model, getConfiguredModel(body.model))?.replace(/\[1m\]$/i, "");
+  const native = selectModel(body.model, getConfiguredModel(body.model))?.replace(/\[1m\]$/i, "");
+  const model = native && catalogModelId(native, getGatewayModel(native)?.owned_by);
   const usage = {
     input_tokens: Math.ceil(requestBytes / ESTIMATED_BYTES_PER_TOKEN),
     output_tokens: Math.ceil(Buffer.byteLength(text) / ESTIMATED_BYTES_PER_TOKEN)
   };
   if (!body.stream) {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ id: "msg_" + Date.now(), type: "message", role: "assistant", model: toGatewayModelId(model),
+    res.end(JSON.stringify({ id: "msg_" + Date.now(), type: "message", role: "assistant", model,
       content: [{ type: "text", text }], stop_reason: "end_turn", stop_sequence: null, usage }));
     return;
   }
@@ -339,7 +340,7 @@ async function openAnthropicStream(clientRes, model, requestId, initialMessage =
       stop_sequence: null,
       usage: { input_tokens: 0, output_tokens: 0 },
       ...initialMessage,
-      model: toGatewayModelId(model)
+      model
     }
   });
   await writeWithBackpressure(clientRes, `: waiting for upstream response\n\n`);
@@ -557,7 +558,7 @@ async function answerWebSearch(anthropicBody, search, model, requestId, res, cap
       onCacheUsage: (usage) => logEvent(requestId, "OpenAI prompt cache usage", usage) });
     stopKeepAlive();
     logEvent(requestId, "Web search completed", { model: result.model, auth_kind: result.authKind, searches: result.searches, results: result.hits, capped: result.capped });
-    const message = toAnthropicMessage(result, toGatewayModelId(model));
+    const message = toAnthropicMessage(result, model);
     if (!anthropicBody.stream) {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(message));
@@ -582,7 +583,7 @@ async function answerWebSearch(anthropicBody, search, model, requestId, res, cap
 const macosService = createMacosService({ proxyPath: __filename, port: PORT, onHandoff: shutdownProxy });
 const projectMemoryInstaller = createProjectMemoryInstaller({ configRoot: getClaudeConfigRoot() });
 const claudeLauncherInstaller = createClaudeLauncherInstaller({ store: credentialStore });
-const claudeSetup = createClaudeSetup({ store: credentialStore, getAvailableModels, getGptModels, launcherInstaller: claudeLauncherInstaller });
+const claudeSetup = createClaudeSetup({ store: credentialStore, getGptModels, launcherInstaller: claudeLauncherInstaller });
 const authRouter = createAuthRouter({
   port: PORT,
   macosService,
@@ -592,7 +593,8 @@ const authRouter = createAuthRouter({
   setup: claudeSetup,
   summarySettings: createSummarySettings({ getDefaultModel: summaryModel.getDefaultModel, listModels: summaryModel.listModels,
     defaultPrompt: DEFAULT_SUMMARY_PROMPT }),
-  onCredentialsChanged: (provider) => {
+  onCredentialsChanged: (provider, { preserveCatalog = false } = {}) => {
+    if (provider === "nvidia") { getAvailableModels.invalidate(preserveCatalog ? undefined : provider); return; }
     getAvailableModels.invalidate();
     getGptModels.invalidate();
     if (!["openai", "openai-codex"].includes(provider)) return;
@@ -693,20 +695,22 @@ const server = http.createServer(async (req, res) => {
         if (readOnly && operation !== "/v1/messages/count_tokens") { sendJsonError(res, 404, "Unsupported messages operation"); return; }
         const route = await resolveGatewayModel(model, getAvailableModels);
         if (!route?.api) { sendJsonError(res, 400, `Unsupported model: ${model || "(missing)"}`); return; }
-        const capabilities = getModelCapabilities(model, () => route);
+        anthropicBody.model = route.id;
+        const clientModel = catalogModelId(route.id.replace(/\[1m\]$/i, ""), route.owned_by);
+        const capabilities = getModelCapabilities(route.id, () => route);
         if (readOnly) {
           await countTokens(anthropicBody, req, res, capabilities);
           return;
         }
         const search = parseWebSearchRequest(anthropicBody);
         if (search) {
-          await answerWebSearch(anthropicBody, search, model, requestId, res, capabilities);
+          await answerWebSearch(anthropicBody, search, clientModel, requestId, res, capabilities);
           return;
         }
         const requestOptions = { route, clientHeaders: req.headers, url: req.url };
         if (isStream) {
           // Client wants streaming - bridge unified Pi events to Anthropic SSE.
-          streamToClient(anthropicBody, model, requestId, res, responseHandler, requestOptions);
+          streamToClient(anthropicBody, clientModel, requestId, res, responseHandler, requestOptions);
         } else {
           const control = {};
           let responseHeaders = {};
@@ -722,7 +726,8 @@ const server = http.createServer(async (req, res) => {
             });
             if (res.destroyed || res.writableEnded) return;
             res.writeHead(200, { ...responseHeaders, "Content-Type": "application/json" });
-            res.end(JSON.stringify(responseHandler ? responseHandler.message(anthropicResp) : anthropicResp));
+            const response = { ...anthropicResp, model: clientModel };
+            res.end(JSON.stringify(responseHandler ? responseHandler.message(response) : response));
           } finally {
             res.off("close", onClose);
           }

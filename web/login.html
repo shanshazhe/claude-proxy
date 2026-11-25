@@ -24,6 +24,8 @@
     .intro { color: #526176; margin: 0 0 22px; }
     .card { background: #fff; border: 1px solid #dce2ec; border-radius: 14px; padding: 20px; margin: 14px 0; box-shadow: 0 3px 14px rgb(24 39 75 / 5%); }
     .row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    #nvidia-keys { list-style: none; padding: 0; }
+    #nvidia-keys li { margin: 8px 0; }
     .status { color: #526176; margin: 4px 0 12px; }
     .status[data-kind="success"] { color: #137044; }
     .status[data-kind="error"] { color: #b42318; }
@@ -38,8 +40,9 @@
     label { display: block; font-weight: 650; margin: 12px 0 6px; }
     .toggle { display: flex; align-items: center; gap: 10px; font-weight: 650; margin: 12px 0; }
     .toggle input { width: 20px; height: 20px; margin: 0; }
-    select { width: 100%; min-height: 44px; border: 1px solid #aab5c6; border-radius: 8px; padding: 8px 12px; background: Canvas; color: CanvasText; font: inherit; }
-    select:disabled, textarea:disabled, .toggle input:disabled { opacity: .62; cursor: not-allowed; }
+    select, input[type="password"] { width: 100%; min-height: 44px; border: 1px solid #aab5c6; border-radius: 8px; padding: 8px 12px; background: Canvas; color: CanvasText; font: inherit; }
+    input[type="password"] { margin-bottom: 12px; }
+    select:disabled, textarea:disabled, input:disabled { opacity: .62; cursor: not-allowed; }
     textarea { width: 100%; min-height: 130px; resize: vertical; border: 1px solid #aab5c6; border-radius: 8px; padding: 12px; background: Canvas; color: CanvasText; font: 14px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
     .hint, .footnote { color: #526176; font-size: .92rem; }
     .summary { border-radius: 8px; background: #eef3fb; padding: 12px; overflow-wrap: anywhere; }
@@ -98,9 +101,23 @@
       </div>
     </section>
 
+    <section class="card" aria-labelledby="nvidia-heading">
+      <h2 id="nvidia-heading">NVIDIA Build</h2>
+      <p id="nvidia-status" class="status" role="status" aria-live="polite">Loading NVIDIA Build status…</p>
+      <p class="hint">Create a key at <a href="https://build.nvidia.com/settings/api-keys" target="_blank" rel="noopener noreferrer">NVIDIA Build</a>. The local proxy checks it with NVIDIA and saves it in the local credential store.</p>
+      <label for="nvidia-api-key">NVIDIA API key</label>
+      <input id="nvidia-api-key" type="password" autocomplete="off" spellcheck="false" disabled>
+      <div class="row">
+        <button id="nvidia-save" type="button" disabled>Add API key</button>
+      </div>
+      <p id="nvidia-saved-heading"><strong>Saved keys</strong></p>
+      <ul id="nvidia-keys" aria-labelledby="nvidia-saved-heading"></ul>
+      <p id="nvidia-result" class="status" role="status" aria-live="polite"></p>
+    </section>
+
     <section class="card" aria-labelledby="cli-heading">
       <h2 id="cli-heading">Configure Claude CLI</h2>
-      <p>Replaces the Claude CLI endpoint, placeholder authentication, and default model. With GPT credentials, also sets up dynamic context capacity for new macOS zsh or Windows PowerShell terminals, unless explicitly disabled. Keep the proxy running. Existing routing keys are backed up; official credentials are untouched. Project, shell, and managed configuration overrides may still apply.</p>
+      <p>Configures the Claude CLI endpoint and placeholder authentication without changing your model choice. With GPT credentials, also sets up dynamic context capacity for new macOS zsh or Windows PowerShell terminals, unless explicitly disabled. Keep the proxy running. Existing routing keys are backed up; official credentials are untouched. Project, shell, and managed configuration overrides may still apply.</p>
       <p id="cli-status" class="status" role="status" aria-live="polite">Loading configuration status…</p>
       <button id="cli-configure" type="button" disabled>Configure Claude CLI</button>
     </section>
@@ -233,7 +250,61 @@
       if (service?.state === "pending" && service.operation?.id && !macosServiceBusy) followMacosOperation(service);
       const copilot = status.copilot || {};
       setMessage(document.getElementById("copilot-status"), copilot.configured ? "GitHub Copilot is configured." : "GitHub Copilot is not configured yet.", copilot.configured ? "success" : "");
+      renderNvidiaStatus(status.nvidia);
       document.getElementById("storage-path").textContent = `Credential directory: ${String(status.storagePath || "managed by the local service")}`;
+    }
+
+    let nvidiaStatus;
+    let nvidiaBusy = false;
+    function renderNvidiaStatus(status) {
+      nvidiaStatus = status;
+      const input = document.getElementById("nvidia-api-key");
+      const supportsKeyList = Array.isArray(status?.keys);
+      input.disabled = !supportsKeyList || status.environmentOverride || nvidiaBusy;
+      document.getElementById("nvidia-save").disabled = input.disabled;
+      const rows = (supportsKeyList ? status.keys : []).map((key, index) => {
+        const row = document.createElement("li");
+        row.className = "row";
+        const label = document.createElement("span");
+        label.textContent = `Key ${index + 1} · ••••${key.suffix}`;
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "secondary";
+        remove.textContent = "Remove";
+        remove.setAttribute("aria-label", `Remove NVIDIA key ${index + 1}`);
+        remove.disabled = input.disabled;
+        remove.addEventListener("click", () => saveNvidiaKey(key.id));
+        row.replaceChildren(label, remove);
+        return row;
+      });
+      document.getElementById("nvidia-keys").replaceChildren(...rows);
+      setMessage(document.getElementById("nvidia-status"), !status ? "NVIDIA Build status is unavailable."
+        : !supportsKeyList ? "Restart the local proxy to manage saved NVIDIA keys."
+          : status.environmentOverride ? "NVIDIA_API_KEY is set in the proxy environment and takes precedence."
+          : status.configured ? "NVIDIA Build is configured." : "No NVIDIA Build key is saved.", status?.configured ? "success" : "");
+    }
+
+    async function saveNvidiaKey(removeId) {
+      const input = document.getElementById("nvidia-api-key");
+      if (input.disabled || (removeId && !nvidiaStatus.keys?.some((key) => key.id === removeId))) return;
+      const result = document.getElementById("nvidia-result");
+      const apiKey = removeId ? "" : input.value.trim();
+      if (!removeId && !apiKey) { setMessage(result, "Enter an NVIDIA Build API key.", "error"); return; }
+      nvidiaBusy = true;
+      if (!removeId) input.value = "";
+      renderNvidiaStatus(nvidiaStatus);
+      setMessage(result, removeId ? "Removing the saved key…" : "Checking the key with NVIDIA Build…");
+      try {
+        const body = removeId ? { removeId } : { apiKey };
+        const response = await apiRequest("/api/auth/nvidia/configure", { method: "POST", body: JSON.stringify(body), timeoutMs: 15000 });
+        setMessage(result, removeId ? (response.changed ? "Saved key removed." : "That key is already removed.")
+          : response.changed ? "Key saved. Start a new Claude Code session if /model still shows the old list." : "This key is already saved.", "success");
+      } catch (error) {
+        setMessage(result, error.httpStatus ? error.message : "Unable to update the NVIDIA key. Please try again.", "error");
+      } finally {
+        nvidiaBusy = false;
+        await refreshStatus();
+      }
     }
 
     let projectMemoryBusy = false;
@@ -551,6 +622,7 @@
         for (const id of ["chatgpt-status", "copilot-status"]) {
           setMessage(document.getElementById(id), "Unable to load status. Make sure the local service is running, then try again.", "error");
         }
+        renderNvidiaStatus(undefined);
         document.getElementById("storage-path").textContent = "Credential directory: temporarily unavailable";
         document.getElementById("macos-service-configure").disabled = true;
         setMessage(document.getElementById("macos-service-status"), "Unable to load macOS service status. Configuration is disabled.", "error");
@@ -588,7 +660,6 @@
           ? "Open a new terminal and run claude, then use /model."
           : "Statusline is configured for the next refresh or new session.";
         successMessage = `${result.message || "Configuration successful."} ${detail}`;
-        if (result.model) successMessage += ` Model: ${String(result.model)}.`;
         if (result.notice) successMessage += ` ${String(result.notice)}`;
       } catch (error) {
         failureMessage = error.message || "Unable to configure. Please try again.";
@@ -706,6 +777,7 @@
       }
     }
 
+    document.getElementById("nvidia-save").addEventListener("click", () => saveNvidiaKey());
     document.getElementById("cli-configure").addEventListener("click", () => configureSetup("cli", "/api/auth/claude/configure"));
     document.getElementById("statusline-configure").addEventListener("click", () => configureSetup("statusline", "/api/auth/statusline/configure"));
     document.getElementById("hud-install").addEventListener("change", installHud);

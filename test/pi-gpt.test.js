@@ -195,6 +195,13 @@ for (const envelope of ["http", "event", "failed"]) {
   });
 }
 
+test("Codex HTTP context-limit code is retained even when Pi returns only the message", async () => {
+  const detail = { code: "context_length_exceeded", message: "too much input" };
+  await assert.rejects(request({}, { loadAuth: async () => ({ kind: "codex", token: jwt("context"), accountId: "context" }),
+    fetchImpl: async () => Response.json({ error: detail }, { status: 400 }) }),
+  { status: 400, code: detail.code, message: `prompt is too long: ${detail.message} (code=${detail.code})` });
+});
+
 test("custom API endpoints, refusals and max-output truncation retain their public semantics", async () => {
   const previous = process.env.OPENAI_BASE_URL;
   process.env.OPENAI_BASE_URL = "https://custom.example/v1";
@@ -213,33 +220,24 @@ test("custom API endpoints, refusals and max-output truncation retain their publ
   } finally { if (previous === undefined) delete process.env.OPENAI_BASE_URL; else process.env.OPENAI_BASE_URL = previous; }
 });
 
-test("a buffering gateway may delay headers beyond the post-header idle limit", async (t) => {
-  // Load the lazy runtime before replacing timers.
+test("proxy adds no idle deadline to Pi streams and still cancels a stalled body on disconnect", async (t) => {
   await request({});
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  let release;
-  let notify;
-  const fetching = new Promise((resolve) => { notify = resolve; });
-  const pending = request({}, { fetchImpl: () => new Promise((resolve) => { release = () => resolve(sse(eventsFor())); notify(); }) });
-  await fetching;
-  t.mock.timers.tick(120000);
-  release();
-  assert.equal((await pending).stop_reason, "end_turn");
-});
-
-test("a stalled response body aborts after the post-header idle limit", async (t) => {
-  await request({});
-  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const control = {};
   let notify;
   const received = new Promise((resolve) => { notify = resolve; });
-  const pending = request({}, { fetchImpl: async () => {
+  let canceled = false;
+  const pending = request({}, { control, fetchImpl: async () => {
     setImmediate(notify);
-    return new Response(new ReadableStream({ pull() {} }), { headers: { "Content-Type": "text/event-stream" } });
+    return new Response(new ReadableStream({ cancel() { canceled = true; } }), { headers: { "Content-Type": "text/event-stream" } });
   } });
-  const rejected = assert.rejects(pending, (error) => error.status === 504 && /idle/.test(error.message));
+  const rejected = assert.rejects(pending, { status: 499, message: "client closed" });
   await received;
   t.mock.timers.tick(90001);
+  assert.equal(canceled, false);
+  control.abort("client closed", 499);
   await rejected;
+  assert.equal(canceled, true);
 });
 
 test("missing terminal events fail instead of inventing success", async () => {

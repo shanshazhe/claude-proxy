@@ -40,10 +40,10 @@ Claude Code / Anthropic Messages client
  OpenAI API or Codex        GitHub Copilot
 ```
 
-- GPT and Copilot Claude generation use the pinned `@earendil-works/pi-ai@1.6.0` runtime dependency, through OpenAI / Codex Responses and Anthropic Messages transports respectively. Both share an internal request dispatcher and a Pi-to-Anthropic response bridge; the external API remains Anthropic Messages JSON / SSE. The gateway does not add a second agent loop or execute client tools.
-- GPT and Claude generation both use Pi's model registry and `Models.stream()` with a normalized transcript. The live, account-scoped catalog determines routing from provider and API metadata, not model-name patterns. Provider-only controls that Pi cannot express are handled at its provider boundary.
+- Inference uses the pinned `@earendil-works/pi-ai@1.6.0`: OpenAI / Codex Responses for GPT, Anthropic Messages for Copilot Claude, and Chat Completions for NVIDIA Build. They share the dispatcher and Pi-to-Anthropic bridge; the external API remains Anthropic Messages JSON / SSE. The gateway does not execute client tools.
+- All three paths use Pi's model registry and `Models.stream()` with a normalized transcript. The gateway routes by catalog provider and API metadata.
 - Token counting and server search are separate operations. Counting uses the native read-only endpoint where registered and a marked local estimate otherwise; it never invokes generation. Search uses a registered Pi-backed capability on the same account.
-- `/v1/models` merges the two dynamic catalogs available to the current credentials. There is no bundled static account model list; Pi's bundled catalog does not replace account-driven discovery, add providers, or add a new model menu.
+- `/v1/models` merges the live catalogs for the configured credentials. Pi's bundled metadata can describe a listed model but does not make unavailable models appear.
 - `/login` manages local device authorization, CLI routing, Statusline setup, Online Summary settings, optional macOS service registration, and the gateway-maintained Project Code Memory switch. It does not collect account passwords. Login, credential storage, and the `OPENAI_API_KEY` override priority remain gateway-managed.
 - The proxy remains CommonJS and loads Pi through dynamic `import()`. There is no build step, but npm runtime dependencies must be installed with `npm ci` before launching.
 
@@ -136,6 +136,16 @@ OPENAI_API_KEY='<your-api-key>' node --use-system-ca mac/proxy.js
 
 Do not put real keys in the repository, screenshots, or shared command history. On Windows, set the variable in the current terminal or through the system environment-variable settings before starting the proxy. Restart the proxy after changing its environment variables.
 
+### NVIDIA Build API key
+
+On `/login`, use **NVIDIA Build → Add API key**. The proxy validates each key with NVIDIA, stores it locally (not in Claude settings), and refreshes its model catalog without a restart. The page lists saved keys by their last four characters, newest first, and lets you remove keys individually. `NVIDIA_API_KEY` takes precedence over saved keys and disables editing from the page.
+
+New NVIDIA inference requests cycle through saved keys in the order they were added, restarting from the first when the list changes. Model discovery still uses the newest saved key. NVIDIA inference requests share one paced send schedule (default `NVIDIA_GLOBAL_RPM=100`, `NVIDIA_GLOBAL_BURST=1`). Set the RPM no higher than your provider quota; `0` disables local pacing. An upstream HTTP 429 terminates only that request and returns a rate-limit error (HTTP 429 for JSON, `rate_limit_error` on an open SSE stream). No retry, model switch, key switch or cooldown is triggered.
+
+The gateway merges NVIDIA Build chat models into `/v1/models`. Start a new Claude Code session if `/model` still shows the old catalog. Examples: `anthropic/z-ai/glm-5.3-flash` and `anthropic/nvidia/nemotron-3.5-super-vl-120b-a12b`.
+
+This path uses Pi's NVIDIA Chat Completions provider. Tool and image support vary by model. Token counting is a local estimate; Claude Code's built-in WebSearch is not routed to NVIDIA. An existing `CLAUDE_CODE_MAX_CONTEXT_TOKENS` override is not recalculated when switching models, so keep it within the selected model's limits for long sessions.
+
 ### Credential storage and import
 
 The default store is:
@@ -144,7 +154,7 @@ The default store is:
 ~/.claude/claude-proxy/auth.json
 ```
 
-It stores authentication data for `openai`, `openai-codex`, and `github-copilot`. Refresh-token updates preserve the existing format and check both the refresh token and `loginVersion` to prevent an older refresh from overwriting a newer login. A new login replaces that provider's previous login fields while preserving other providers.
+It stores authentication data for `openai`, `openai-codex`, `github-copilot`, and `nvidia`. Refresh-token updates preserve the existing format and check both the refresh token and `loginVersion` to prevent an older refresh from overwriting a newer login. A new login replaces that provider's previous login fields while preserving other providers.
 
 On platforms with Unix permissions, the directory uses `0700` and the file uses `0600`. Updates use temporary files in the same directory and atomic publication. On Windows, also rely on account isolation and file ACLs; Unix mode values are not a complete access-control mechanism.
 
@@ -162,7 +172,7 @@ Importing a module does not create credential directories or migrate files. `CLA
 
 1. Keep the proxy running and configure at least one upstream authentication method first.
 2. On `/login`, wait until **Configure Claude CLI** is enabled, then click it.
-3. The proxy validates the CLI installation, credentials, settings structure, and authentication conflicts, then selects an available model from the dynamic catalog that matches the current credentials.
+3. The proxy validates the CLI installation, local credentials, settings structure, and authentication conflicts, then saves the routing settings without fetching or selecting a model.
 4. **Keep the proxy running, open a new terminal**, and run `claude`. Use `/model` in an interactive session to switch models. With GPT credentials available, the button also installs or repairs the [capacity entry point](#automatic-gpt-capacity-on-session-start) on macOS + zsh and Windows PowerShell, respecting an explicit opt-out. This covers first-time setup when the proxy started before login; restarting the proxy is not required. If launcher setup is skipped or fails, the result includes a notice: routing is saved, but GPT may still use Claude Code's default context window.
 
 The default settings file is `~/.claude/settings.json`. When `CLAUDE_CONFIG_DIR` is set, the proxy uses the actual `settings.json` in that directory, with support for `~` expansion. Model settings are cached by mtime and reread on later requests when the file changes.
@@ -176,13 +186,12 @@ The configuration button merges these fields:
     "ANTHROPIC_API_KEY": "sk-placeholder",
     "CLAUDE_CODE_USE_GATEWAY": "1",
     "CLAUDE_GATEWAY_ALLOW_LOOPBACK": "1",
-    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
-    "ANTHROPIC_MODEL": "<gateway model ID selected from the current dynamic catalog>"
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
   }
 }
 ```
 
-`sk-placeholder` is a local routing placeholder, not an upstream API key. The operation removes the superseded `env.ANTHROPIC_AUTH_TOKEN` while preserving unrelated environment variables, hooks, permissions, plugins, `model`, and an existing `statusLine`. An existing explicit model is retained when available; otherwise, the first catalog entry matching the credentials is selected. No fixed model version is installed.
+`sk-placeholder` is a local routing placeholder, not an upstream API key. The operation removes the superseded `env.ANTHROPIC_AUTH_TOKEN` while preserving unrelated settings, including the top-level `model` and any existing `env.ANTHROPIC_MODEL`. The button never sets a default model. If an older setup wrote an unwanted `env.ANTHROPIC_MODEL`, remove that override separately so `/model` can control the default.
 
 Before writing, the original settings bytes, including any BOM and formatting, are backed up to:
 
@@ -360,7 +369,7 @@ curl http://127.0.0.1:8082/v1/models
 curl http://127.0.0.1:8082/features
 ```
 
-The catalog returns GPT models as `anthropic/<model ID>` and Claude models under their plain ID. Claude Code's `/model` picker lists only gateway IDs that contain `claude` or `anthropic`, and it applies `CLAUDE_CODE_MAX_CONTEXT_TOKENS` only to IDs that do not start with `claude-`; the `anthropic/` prefix satisfies both. The shared macOS/Windows launcher and GPT JSON/SSE responses use the same `anthropic/<model ID>` identity as the catalog, so Claude Code saves a discoverable model ID for session restoration. Only upstream requests strip `anthropic/`; the old `claude-gateway/` spelling is no longer supported. When `capabilities.limits.max_context_window_tokens` is a valid positive integer, it decides the `[1m]` extended-context marker on Claude IDs: only limits of at least 1,000,000 tokens get the suffix, so Copilot's `claude-haiku-4.5` at 200K does not. GPT IDs never get it, because on them `[1m]` would override `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. Without a valid catalog limit, the existing GPT Sol/Luna/Terra and Claude family rules remain in effect. The suffix is never duplicated and is removed before forwarding. This marker is not an upstream expansion or a guarantee of the account's actual context allowance; upstream capabilities depend on the account catalog and request results.
+The catalog presents GPT as `anthropic/openai/<model ID>` (shown as `openai/<model ID>` in `/model`) and Claude as `anthropic/claude-…`, with only one `anthropic/` prefix. NVIDIA catalog IDs are unchanged. These are client-facing IDs: the gateway resolves them to the original provider catalog ID before sending a request upstream. Select your model again in `/model` after upgrading. A Claude model with a declared context window of at least 1,000,000 tokens gets a `[1m]` display suffix. GPT models with a declared capacity use the launcher’s `CLAUDE_CODE_MAX_CONTEXT_TOKENS` without that suffix. The display suffix does not extend upstream limits.
 
 Requests may use the full gateway ID from the catalog or an explicit raw GPT / Claude model ID. CLI aliases such as `sonnet`, `opus`, `haiku`, and `default` use the model configured in settings. Send an explicit model ID if no default is configured. Other model types return HTTP 400 instead of being routed to the wrong provider.
 
@@ -371,7 +380,7 @@ curl http://127.0.0.1:8082/v1/messages \
   -H 'Content-Type: application/json' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{
-    "model": "anthropic/gpt-<available-id>",
+    "model": "anthropic/openai/gpt-<available-id>",
     "max_tokens": 256,
     "stream": false,
     "messages": [{"role":"user","content":"Explain the purpose of this gateway in one sentence."}]
@@ -411,7 +420,7 @@ Use `/login` for login and configuration operations; these endpoints do not supp
 - **Images:** Ordinary GPT image blocks become Responses `input_image` items. Images in tool results are attached to a following multimodal user message. Copilot receives native image structures and a vision request header. Image support depends on the selected model and account; unsupported or invalid sources are replaced with explanatory text.
 - **Reasoning:** GPT supports public reasoning summaries, not native Claude's full thinking / signature protocol. Literal `<think>` text in an answer is not misclassified as a GPT reasoning block. Copilot adapts adaptive thinking using catalog capabilities while preserving native signatures and compatibility fallbacks.
 
-The request-body limit is 32 MiB. OpenAI requests have a one-hour total timeout and are canceled after 90 seconds without data once upstream response headers have arrived. GPT SSE attempts a keepalive every 10 seconds. Copilot requests also have a one-hour total timeout, but do not use the same idle-timer behavior as OpenAI.
+The request-body limit is 32 MiB. All generation adapters pass a one-hour `timeoutMs` to Pi, which applies it according to the upstream transport. The proxy does not impose a separate generation or idle deadline. Client disconnects still cancel upstream work, and SSE keepalives do not change the upstream timeout.
 
 ## Built-in WebSearch
 
@@ -419,7 +428,7 @@ Claude Code's built-in **WebSearch** tool sends its own request whose only tool 
 
 | Session model | Where the search runs |
 | --- | --- |
-| GPT (`anthropic/gpt-…`) | The same model and ChatGPT/Codex login (or `OPENAI_API_KEY`) |
+| GPT (`anthropic/openai/gpt-…`) | The same model and ChatGPT/Codex login (or `OPENAI_API_KEY`) |
 | Copilot Claude (`claude-…`) | The newest Luna in the Copilot catalog, on Copilot `/responses` with the same Copilot login. Copilot's Claude `/v1/messages` endpoint rejects server-side web search (`The use of the web search tool is not supported`), so only this one search step uses a GPT model; the conversation stays on Claude |
 
 - **Results:** Hits come only from the upstream `web_search_call` sources (http/https, de-duplicated); titles come from the upstream URL citations, otherwise the URL is shown. Nothing is extracted from answer text, and Anthropic `encrypted_content` is never fabricated. The upstream's short summary is passed through as text.
@@ -514,6 +523,7 @@ Pass these variables to the **proxy process**, not just to another terminal runn
 | Variable | Behavior |
 | --- | --- |
 | `OPENAI_API_KEY` | Uses an OpenAI API key instead of stored ChatGPT credentials; never persisted |
+| `NVIDIA_API_KEY` | Overrides a saved NVIDIA Build key; the environment value is never persisted |
 | `OPENAI_BASE_URL` | Base URL for `/models` and `/responses` in API-key mode; defaults to `https://api.openai.com/v1` and does not replace official Codex / ChatGPT OAuth endpoints |
 | `PI_AUTH_FILE` | Explicit read-only import source at startup; an existing destination is never overwritten |
 | `CLAUDE_CONFIG_DIR` | Actual CLI settings root; private backups, Statusline generations, and service state/logs live under its `claude-proxy/` directory; defaults to `~/.claude` |

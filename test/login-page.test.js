@@ -7,16 +7,19 @@ const vm = require("vm");
 // 使用最小 DOM 与假 fetch 验证页面事件，不读取真实凭据或调用上游。
 function pageHarness(_unused, { status, configure, requestImpl, fastWait = false } = {}) {
   const elements = new Map();
+  const newElement = () => ({
+    value: "", textContent: "", dataset: {}, hidden: true, disabled: false, attributes: {}, listeners: {}, classList: { add() {}, remove() {} },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    addEventListener(name, handler) { this.listeners[name] = handler; },
+    replaceChildren(...children) { this.children = children; }
+  });
   const element = (id) => {
-    if (!elements.has(id)) elements.set(id, {
-      value: "", textContent: "", dataset: {}, hidden: true, disabled: ["cli-configure", "statusline-configure", "hud-install", "macos-service-configure", "project-memory-enabled", "coding-discipline-install"].includes(id), attributes: {}, listeners: {}, classList: { add() {}, remove() {} },
-      setAttribute(name, value) { this.attributes[name] = value; },
-      addEventListener(name, handler) { this.listeners[name] = handler; },
-      replaceChildren(...children) { this.children = children; }
-    });
+    if (!elements.has(id)) elements.set(id, Object.assign(newElement(), {
+      disabled: ["cli-configure", "statusline-configure", "hud-install", "macos-service-configure", "project-memory-enabled", "coding-discipline-install"].includes(id)
+    }));
     return elements.get(id);
   };
-  const document = { hidden: false, listeners: {}, getElementById: element, createElement: () => ({ value: "", textContent: "" }),
+  const document = { hidden: false, listeners: {}, getElementById: element, createElement: newElement,
     querySelector: () => ({ content: "test-page-nonce" }),
     addEventListener(name, handler) { this.listeners[name] = handler; }
   };
@@ -44,6 +47,44 @@ function pageHarness(_unused, { status, configure, requestImpl, fastWait = false
     authorizationComplete: () => vm.runInNewContext('startLogin("chatgpt")', context),
   };
 }
+
+test("NVIDIA card lists masked keys and removes only the selected key", async () => {
+  let keys = [{ id: "legacy", suffix: "old1" }];
+  let environmentOverride = false;
+  const page = pageHarness(null, { status: () => ({ nvidia: { configured: true, environmentOverride, keys } }),
+    configure: (url, options) => {
+      assert.ok(url.endsWith("/nvidia/configure"));
+      const { removeId } = JSON.parse(options.body);
+      keys = removeId ? keys.filter(({ id }) => id !== removeId) : [{ id: "new", suffix: "page" }, ...keys];
+      return response({ success: true, changed: true });
+    } });
+  await page.refresh();
+  const input = page.element("nvidia-api-key");
+  const save = page.element("nvidia-save");
+  const rows = () => page.element("nvidia-keys").children;
+  assert.equal(rows().length, 1);
+  input.value = " nvapi-fixture-page ";
+  await save.listeners.click();
+  const postBodies = () => page.requests.filter((call) => call.options.method === "POST").map((call) => JSON.parse(call.options.body));
+  assert.deepEqual(postBodies(), [{ apiKey: "nvapi-fixture-page" }]);
+  assert.equal(input.value, "");
+  assert.equal(rows().length, 2);
+  assert.equal(rows()[0].children[0].textContent, "Key 1 · ••••page");
+  assert.equal(rows()[1].children[0].textContent, "Key 2 · ••••old1");
+  assert.equal(page.element("nvidia-status").textContent, "NVIDIA Build is configured.");
+  assert.doesNotMatch(page.element("nvidia-result").textContent, /nvapi-fixture/);
+  await rows()[0].children[1].listeners.click();
+  assert.deepEqual(postBodies().at(-1), { removeId: "new" });
+  assert.equal(rows().length, 1);
+  assert.equal(rows()[0].children[0].textContent, "Key 1 · ••••old1");
+  environmentOverride = true;
+  await page.refresh();
+  assert.equal(input.disabled, true);
+  assert.equal(save.disabled, true);
+  assert.equal(rows()[0].children[1].disabled, true);
+  await save.listeners.click();
+  assert.equal(postBodies().length, 2);
+});
 
 test("Project Code Memory checkbox gates, configures, reports success, and restores on failure", async () => {
   let enabled = false;

@@ -40,6 +40,7 @@ test("replay is isolated by model, account, session and complete preceding histo
   const continued = continueWith(body, answer);
   for (const [next, credentials] of [
     [{ ...continued, model: "gpt-other" }, auth],
+    [{ ...continued, model: `openai/${continued.model}` }, auth],
     [continued, { ...auth, accountId: "another-account" }],
     [{ ...continued, prompt_cache_key: "another-session" }, auth],
     [{ ...continued, system: "changed instructions" }, auth],

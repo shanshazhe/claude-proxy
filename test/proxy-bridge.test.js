@@ -176,8 +176,8 @@ for (const platform of ["mac", "windows"]) {
     await route({ method: "GET", url: "/v1/models?limit=1000" }, listResponse);
     const models = JSON.parse(listResponse.body).data;
     assert.ok(models.length > 0);
-    assert.ok(models.every((entry) => /^(?:claude-|anthropic\/gpt-)/.test(entry.id)));
-    assert.ok(models.some((entry) => entry.display_name === "gpt-5.4"));
+    assert.ok(models.every((entry) => /^anthropic\/(?:claude-|openai\/gpt-)/.test(entry.id)));
+    assert.ok(models.some((entry) => entry.display_name === "openai/gpt-5.4"));
 
     for (const model of ["claude-sonnet-5.5", "claude-sonnet-5.5[1m]", "anthropic/claude-sonnet-5.5"]) {
       const request = new EventEmitter();
@@ -195,7 +195,7 @@ for (const platform of ["mac", "windows"]) {
       request.emit("end");
       const events = (await done).split("\n\n").filter((frame) => frame.startsWith("event:"))
         .map((frame) => JSON.parse(frame.split("\ndata: ")[1]));
-      assert.equal(events[0].message.model, "claude-sonnet-5.5");
+      assert.equal(events[0].message.model, "anthropic/claude-sonnet-5.5");
       assert.equal(events[0].message.id, "msg_fixture");
       assert.equal(events[0].message.usage.input_tokens, 7);
       assert.equal(copilotRequests.at(-1).thinking.type, "adaptive");
@@ -467,12 +467,13 @@ for (const platform of ["mac", "windows"]) {
     assert.deepEqual([collected.content[0].text, collected.stop_reason, collected.role], ["Done. 完成", "end_turn", "assistant"]);
     assert.equal(JSON.stringify(enqueued), JSON.stringify([{ root: "/repo", changed_paths: ["a.js"] }]));
     assert.equal(forwarded.length, 0);
-    for (const model of ["gpt-6.1-sol", "anthropic/gpt-6.1-sol[1m]", "sonnet"]) {
+    for (const [model, expected] of [["gpt-6.1-sol", "anthropic/gpt-6.1-sol"],
+      ["anthropic/openai/gpt-6.1-sol[1m]", "anthropic/openai/gpt-6.1-sol"], ["sonnet", "anthropic/gpt-6.1-sol"]]) {
       for (const stream of [false, true]) {
         const reply = await send({ ...payload(stream), model });
         const start = stream && reply.body.split("\n\n").find((frame) => frame.startsWith("event: message_start\n"));
         const actual = stream ? JSON.parse(start.split("\ndata: ")[1]).message : JSON.parse(reply.body);
-        assert.equal(actual.model, "anthropic/gpt-6.1-sol");
+        assert.equal(actual.model, expected);
       }
     }
     assert.equal(forwarded.length, 0);
@@ -567,7 +568,7 @@ for (const platform of ["mac", "windows"]) {
     const events = streamed.body.split("\n\n").filter((frame) => frame.startsWith("event:")).map((frame) => JSON.parse(frame.split("\ndata: ")[1]));
     assert.deepEqual(events.map((event) => event.type), ["message_start", "content_block_start", "content_block_delta", "content_block_stop",
       "content_block_start", "content_block_stop", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]);
-    assert.equal(events[0].message.model, "claude-opus-5.5");
+    assert.equal(events[0].message.model, "anthropic/claude-opus-5.5");
     assert.deepEqual(events[4].content_block, content[1]);
     assert.equal(events[9].delta.stop_reason, "end_turn");
     assert.equal(searches[0].copilot, true);
@@ -580,12 +581,12 @@ for (const platform of ["mac", "windows"]) {
     const collected = JSON.parse((await send(payload("anthropic/gpt-6.1-sol[1m]", false))).body);
     assert.deepEqual(collected.content, content);
     assert.equal(collected.stop_reason, "end_turn");
-    assert.equal(collected.model, "anthropic/gpt-6.1-sol");
+    assert.equal(collected.model, "anthropic/openai/gpt-6.1-sol");
     assert.deepEqual([searches[1].copilot, searches[1].body.model], [false, "gpt-6.1-sol"]);
 
     const gptStream = await send(payload("gpt-6.1-sol", true));
     const start = gptStream.body.split("\n\n").find((frame) => frame.startsWith("event: message_start\n"));
-    assert.equal(JSON.parse(start.split("\ndata: ")[1]).message.model, "anthropic/gpt-6.1-sol");
+    assert.equal(JSON.parse(start.split("\ndata: ")[1]).message.model, "anthropic/openai/gpt-6.1-sol");
     assert.equal(searches[2].body.model, "gpt-6.1-sol");
 
     const rejected = await send(payload("gpt-6.1-sol", true, { blocked_domains: ["example.com"] }));

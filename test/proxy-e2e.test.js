@@ -176,7 +176,7 @@ for (const platform of ["mac", "windows"]) {
     assert.equal(memory.headers.get("access-control-allow-origin"), null);
     assert.deepEqual(memoryCalls, ["factory", true]);
     const models = await (await fetch(base + "/v1/models?limit=1000")).json();
-    assert.deepEqual(models.data.map((model) => model.id), ["anthropic/gpt-test", "claude-sonnet-test"]);
+    assert.deepEqual(models.data.map((model) => model.id), ["anthropic/openai/gpt-test", "anthropic/claude-sonnet-test"]);
     assert.equal(discoveryOptions.at(-1)?.waitForRefresh, false);
     assert.equal(discoveryOptions.at(-1)?.gptOnly, false);
     for (const [value, expected] of [["true", true], ["false", false], ["invalid", false]]) {
@@ -185,7 +185,7 @@ for (const platform of ["mac", "windows"]) {
       assert.equal(discoveryOptions.at(-1)?.waitForRefresh, expected);
       assert.equal(discoveryOptions.at(-1)?.gptOnly, false);
       const scoped = await (await fetch(base + "/v1/models?provider=gpt&wait_for_refresh=" + value)).json();
-      assert.deepEqual(scoped.data.map((model) => model.id), ["anthropic/gpt-test"]);
+      assert.deepEqual(scoped.data.map((model) => model.id), ["anthropic/openai/gpt-test"]);
       assert.equal(scoped.data[0].context_window, 872000);
       assert.equal(discoveryOptions.at(-1)?.waitForRefresh, expected);
       assert.equal(discoveryOptions.at(-1)?.gptOnly, true);
@@ -194,7 +194,7 @@ for (const platform of ["mac", "windows"]) {
     authOptions.onCredentialsChanged();
     assert.deepEqual(invalidations.sort(), [false, true], "credential changes invalidate both independent caches");
     const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } };
-    for (const model of ["anthropic/gpt-test", "claude-sonnet-test"]) {
+    for (const model of ["anthropic/openai/gpt-test", "anthropic/claude-sonnet-test"]) {
       for (const stream of [false, true]) {
         const result = await fetch(base + "/v1/messages", { method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ model, stream, max_tokens: 50, system: "instructions", messages: [{ role: "user", content: [{ type: "text", text: "look" }, image] }],
@@ -203,7 +203,7 @@ for (const platform of ["mac", "windows"]) {
         assert.equal(result.headers.get("content-type"), stream ? "text/event-stream" : "application/json");
         const text = await result.text();
         assert.match(text, /cache_read_input_tokens["\s:]+64/);
-        assert.ok(text.includes(model.startsWith("anthropic/gpt-") ? "mock reply" : "native reply"));
+        assert.ok(text.includes(model.startsWith("anthropic/openai/") ? "mock reply" : "native reply"));
         if (stream) {
           assert.match(text, /message_stop/);
           const start = text.split("\n\n").find((frame) => frame.startsWith("event: message_start\n"));
@@ -286,7 +286,7 @@ for (const platform of ["mac", "windows"]) {
     claudeFailure = undefined;
     for (const stream of [false, true]) {
       const launched = buildLaunch(models, ["--model", "gpt-test"], {});
-      assert.deepEqual(launched.args, ["--model", "anthropic/gpt-test"]);
+      assert.deepEqual(launched.args, ["--model", "anthropic/openai/gpt-test"]);
       const result = await fetch(base + "/v1/messages", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model: "gpt-test", stream, messages: [{ role: "user", content: "hello" }] }) });
       assert.equal(result.status, 200);
@@ -313,7 +313,8 @@ for (const platform of ["mac", "windows"]) {
     assert.equal(configured.status, 200);
     const saved = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
     assert.equal(saved.env.KEEP, "yes");
-    assert.equal(saved.env.ANTHROPIC_MODEL, "anthropic/gpt-test");
+    assert.equal(saved.env.ANTHROPIC_MODEL, undefined);
+    assert.equal(saved.env.ANTHROPIC_BASE_URL, "http://localhost:8082");
     assert.equal(saved.statusLine.command, "existing");
     const backups = path.join(configRoot, "claude-proxy", "settings-backups");
     assert.deepEqual(fs.readFileSync(path.join(backups, fs.readdirSync(backups)[0])), original);

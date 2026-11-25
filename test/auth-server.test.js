@@ -97,6 +97,85 @@ test("Host, loopback, nonce, Origin and JSON guards reject cross-site requests",
     headers: { "X-Auth-Nonce": nonce, "Content-Type": "application/json" } })).status, 403);
 });
 
+test("NVIDIA key changes are guarded, validated and never returned to the page", async (t) => {
+  const secret = "nvapi-fixture-first";
+  const bad = "nvapi-fixture-invalid";
+  const changes = [];
+  const upstream = [];
+  const route = "/api/auth/nvidia/configure";
+  const { api, page, store } = await fixture(t, { onCredentialsChanged: (provider, options) => changes.push([provider, options.preserveCatalog]),
+    fetchImpl: async (url, options) => {
+      assert.equal(url, "https://integrate.api.nvidia.com/v1/models");
+      assert.equal(options.redirect, "error");
+      upstream.push(options.headers.Authorization);
+      if (options.headers.Authorization === `Bearer ${bad}`) return Response.json({ error: bad }, { status: 401 });
+      return Response.json({ data: [{ id: "z-ai/glm-5.3-flash" }] });
+    } });
+  assert.ok(page.text.includes('id="nvidia-api-key" type="password"'));
+  const legacy = "nvapi-fixture-legacy";
+  store.saveLogin("openai", { type: "api_key", key: "unchanged" });
+  store.saveLogin("nvidia", { type: "api_key", key: legacy });
+  const post = (body, headers) => api(route, { method: "POST", body: JSON.stringify(body), headers });
+  assert.equal((await post({ apiKey: secret }, { Origin: "https://evil.example" })).status, 403);
+  assert.equal((await post({ apiKey: secret }, { "X-Auth-Nonce": "wrong" })).status, 403);
+  assert.equal((await post({ apiKey: "malformed" })).status, 400);
+  const saved = await post({ apiKey: ` ${secret} ` });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(JSON.parse(saved.text), { success: true, changed: true });
+  const status = await api("/api/auth/status");
+  const { keys, configured, environmentOverride } = JSON.parse(status.text).nvidia;
+  assert.equal(configured, true);
+  assert.equal(environmentOverride, false);
+  assert.deepEqual(keys, [{ id: keys[0].id, suffix: "irst" }, { id: "legacy", suffix: "gacy" }]);
+  for (const key of [legacy, secret]) assert.ok(!status.text.includes(key));
+  assert.equal(JSON.parse((await post({ apiKey: secret })).text).changed, false);
+  const rejected = await post({ apiKey: bad });
+  assert.equal(rejected.status, 400);
+  assert.ok(!rejected.text.includes(bad));
+  assert.deepEqual(store.readAuth().nvidia.keys.map(({ key }) => key), [legacy, secret]);
+  assert.equal((await post({ removeId: keys[0].id })).status, 200);
+  const after = JSON.parse((await api("/api/auth/status")).text).nvidia;
+  assert.deepEqual(after.keys, [{ id: "legacy", suffix: "gacy" }]);
+  assert.equal(JSON.parse((await post({ removeId: keys[0].id })).text).changed, false);
+  assert.equal((await post({ removeId: "legacy" })).status, 200);
+  assert.equal(store.readAuth().nvidia, undefined);
+  assert.equal(store.readAuth().openai.key, "unchanged");
+  assert.deepEqual(upstream, [`Bearer ${secret}`, `Bearer ${secret}`, `Bearer ${bad}`]);
+  assert.deepEqual(changes, [["nvidia", false], ["nvidia", true], ["nvidia", false]]);
+});
+
+test("removing a saved NVIDIA key preserves the catalog during an outage until the last key is removed", async (t) => {
+  let discover;
+  const { api, store } = await fixture(t, { env: {}, onCredentialsChanged: (provider, { preserveCatalog }) =>
+    discover.invalidate(preserveCatalog ? undefined : provider) });
+  store.saveNvidiaKey("nvapi-fixture-one");
+  store.saveNvidiaKey("nvapi-fixture-two");
+  const id = "z-ai/glm-5.3-flash";
+  let offline = false;
+  const unconfigured = async () => { throw new Error("not configured"); };
+  discover = createModelDiscovery({ env: {}, store, loadAuth: unconfigured, loadClaudeAuth: unconfigured,
+    fetchImpl: async () => offline ? Response.json({}, { status: 503 }) : Response.json({ data: [{ id }] }) });
+  const ids = async () => (await discover({ waitForRefresh: true })).data.map((model) => model.id);
+  assert.deepEqual(await ids(), [id]);
+  const { keys } = JSON.parse((await api("/api/auth/status")).text).nvidia;
+  const remove = (removeId) => api("/api/auth/nvidia/configure", { method: "POST", body: JSON.stringify({ removeId }) });
+  offline = true;
+  assert.equal((await remove(keys[0].id)).status, 200);
+  assert.deepEqual(await ids(), [id]);
+  assert.equal((await remove(keys[1].id)).status, 200);
+  assert.deepEqual(await ids(), []);
+});
+
+test("NVIDIA environment override makes the web key controls read-only", async (t) => {
+  const { api, store } = await fixture(t, { env: { NVIDIA_API_KEY: "nvapi-fixture-environment" },
+    fetchImpl: () => assert.fail("must not validate an unused key") });
+  const status = await api("/api/auth/status");
+  assert.deepEqual(JSON.parse(status.text).nvidia, { configured: true, environmentOverride: true, keys: [] });
+  assert.ok(!status.text.includes("nvapi-fixture-environment"));
+  assert.equal((await api("/api/auth/nvidia/configure", { method: "POST", body: '{"removeId":"legacy"}' })).status, 409);
+  assert.equal(fs.existsSync(store.authFile), false);
+});
+
 test("localhost IPv4 and IPv6 page access works with explicit loopback Hosts", async (t) => {
   const { port } = await fixture(t);
   for (const hostname of ["localhost", "127.0.0.1", "::1"]) {
@@ -394,16 +473,13 @@ test("HUD configuration accepts only an enabled boolean on the guarded statuslin
 
 test("HTTP setup rejects absent credentials, returns safe status and concurrently preserves both updates", async (t) => {
   let configRoot;
-  let catalogs = 0;
   const { api, store } = await fixture(t, { env: {}, setupFactory: (store) => {
     configRoot = path.join(store.directory, "cli");
     return createClaudeSetup({ configRoot, store, env: {}, platform: "linux", probe: async () => ({ cli: true, bash: "/bin/bash", jq: "test-jq", node: process.execPath }),
-      getAvailableModels: async () => { catalogs++; return { data: [{ id: "gpt-test", owned_by: "openai", api: "openai-responses" }] }; },
       installer: { validateBundle() {}, deploy: () => ({ command: "local-statusline" }), cleanup() {}, isConfigured: (value) => value?.command === "local-statusline" } });
   } });
   const status = await api("/api/auth/status");
   assert.equal(JSON.parse(status.text).claudeCli.ready, false);
-  assert.equal(catalogs, 0);
   assert.equal((await api("/api/auth/claude/configure", { method: "POST", body: "{}" })).status, 400);
   assert.equal(fs.existsSync(configRoot), false);
   store.saveLogin("openai", { type: "api_key", key: "private-upstream-key" });
@@ -416,8 +492,10 @@ test("HTTP setup rejects absent credentials, returns safe status and concurrentl
     assert.ok(!result.text.includes("sk-placeholder"));
   }
   const saved = JSON.parse(fs.readFileSync(path.join(configRoot, "settings.json"), "utf8"));
-  assert.equal(saved.env.ANTHROPIC_MODEL, "anthropic/gpt-test");
+  assert.equal(saved.env.ANTHROPIC_MODEL, undefined);
+  assert.equal(saved.env.ANTHROPIC_BASE_URL, "http://localhost:8082");
   assert.equal(saved.statusLine.command, "local-statusline");
+  assert.equal(JSON.parse((await api("/api/auth/status")).text).claudeCli.configured, true);
 });
 
 test("setup errors hide raw command output, settings values and invalid conflict fields", async (t) => {

@@ -100,8 +100,7 @@ function startProxy(platform, root, { installer, installerFactory, listen = "suc
       if (name === "../lib/claude-setup") return { ...nativeRequire(name), getClaudeConfigRoot: () => configRoot,
         createClaudeSetup: (options) => {
           calls.setupFactory++;
-          const setup = nativeRequire(name).createClaudeSetup({ ...options, configRoot, env: {}, store, getAvailableModels,
-            probe: async () => ({ cli: true }) });
+          const setup = nativeRequire(name).createClaudeSetup({ ...options, configRoot, env: {}, store, probe: async () => ({ cli: true }) });
           const synchronizeCapacity = setup.syncGptContextCapacity;
           setup.syncGptContextCapacity = () => {
             calls.syncCapacity++;
@@ -325,7 +324,9 @@ for (const platform of ["mac", "windows"]) {
     assert.equal(run.calls.factory, 1);
     assert.equal(run.calls.autoEnable, 2);
     assert.equal(run.calls.autoEnableBeforeListen, 0);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(run.configRoot, "settings.json"))).env.ANTHROPIC_MODEL, "anthropic/gpt-sol-test");
+    const saved = JSON.parse(fs.readFileSync(path.join(run.configRoot, "settings.json")));
+    assert.equal(saved.env.ANTHROPIC_BASE_URL, "http://localhost:8082");
+    assert.equal(saved.env.ANTHROPIC_MODEL, undefined);
   });
 
   test(`${platform} startup does not start the launcher installer when listen fails`, async (t) => {
