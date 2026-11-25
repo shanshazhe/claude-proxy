@@ -30,14 +30,17 @@ test("local credential availability validates structure without refreshing, migr
     [{ openai: api, "openai-codex": {} }, {}, true, false],
     [{ openai: {}, "openai-codex": oauth }, {}, false, false],
     [{ openai: api, "openai-codex": { loginVersion: "new" } }, {}, false, false],
-    [{ openai: {}, "openai-codex": { ...oauth, loginVersion: "new" } }, {}, true, false]
+    [{ openai: {}, "openai-codex": { ...oauth, loginVersion: "new" } }, {}, true, false],
+    [{}, { NVIDIA_API_KEY: " key " }, false, false, true],
+    [{}, { NVIDIA_API_KEY: " \t" }, false, false],
+    [{}, { NVIDIA_API_KEY: 123 }, false, false]
   ];
   for (const invalid of [null, {}, { ...api, key: " " }, { ...api, key: 1 },
     { ...oauth, access: " " }, { ...oauth, refresh: "\t" }, { ...oauth, expires: "0" },
     { ...oauth, expires: Infinity }, { ...oauth, expires: NaN }]) {
     cases.push([{ openai: invalid, "github-copilot": invalid }, {}, false, false]);
   }
-  for (const [auth, env, openai, copilot] of cases) {
+  for (const [auth, env, openai, copilot, nvidia = false] of cases) {
     let reads = 0;
     const store = {
       readAuth(options) { reads++; assert.deepEqual(options, { readOnly: true }); return auth; },
@@ -46,7 +49,7 @@ test("local credential availability validates structure without refreshing, migr
       saveLogin() { assert.fail("must not save"); }
     };
     const before = JSON.stringify(auth);
-    assert.deepEqual(readCredentialAvailability({ env, store }), { openai, copilot });
+    assert.deepEqual(readCredentialAvailability({ env, store }), { openai, "github-copilot": copilot, nvidia });
     assert.equal(reads, 1);
     assert.equal(JSON.stringify(auth), before);
   }

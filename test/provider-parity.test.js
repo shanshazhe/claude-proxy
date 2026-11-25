@@ -66,8 +66,8 @@ test("Claude parity: signed history, native tools, cache breakpoints and tool-re
   });
   const old = await run(true);
   const current = await run(false);
-  assert.deepEqual(current.first, old.first);
-  assert.deepEqual(current.second, old.second);
+  assert.deepEqual(current.first, { ...old.first, model: `anthropic/${model}` });
+  assert.deepEqual(current.second, { ...old.second, model: `anthropic/${model}` });
   assert.deepEqual(current.first.content, blocks);
   assert.deepEqual(current.second.content, final);
   assert.deepEqual(current.second.usage, fixtureUsage);
@@ -125,10 +125,10 @@ test("Codex parity: public reasoning, parallel tools and byte-exact encrypted re
   // Allow that exact presentation difference without trimming signatures or other text.
   assert.equal(old.first.content[0].thinking, "Read both files.");
   assert.equal(current.first.content[0].thinking, "Read both files.\n\n");
-  assert.deepEqual(current.first, { ...old.first, content: [
+  assert.deepEqual(current.first, { ...old.first, model: `anthropic/openai/${model}`, content: [
     { ...old.first.content[0], thinking: old.first.content[0].thinking + "\n\n" }, ...old.first.content.slice(1)
   ] });
-  assert.deepEqual(current.second, old.second);
+  assert.deepEqual(current.second, { ...old.second, model: `anthropic/openai/${model}` });
   assert.equal(current.first.stop_reason, "tool_use");
   assert.deepEqual(current.first.content.filter((block) => block.type === "tool_use").map(({ id }) => id), ["call_right", "call_left"]);
   assert.ok(!JSON.stringify(current.first).includes(native[0].encrypted_content));
@@ -195,7 +195,7 @@ test("GPT → Opus sends visible history and linked tool results, not GPT reason
   const system = "Use only the supplied fixture history.";
   const question = "Read fixture.txt and note the finding.";
   const followUp = "Continue from that finding.";
-  const body = { model: `anthropic/${gpt}`, max_tokens: 256, system, tools: [tool],
+  const body = { model: `anthropic/openai/${gpt}`, max_tokens: 256, system, tools: [tool],
     metadata: { user_id: "parity-model-switch" }, messages: [{ role: "user", content: question }],
     thinking: { type: "adaptive" } };
   const first = await send({ ...body, stream: true });
@@ -208,11 +208,11 @@ test("GPT → Opus sends visible history and linked tool results, not GPT reason
   assert.equal(first.content.length, 4);
   assert.ok(isReplayCarrier(first.content[3].signature));
   const results = toolResults(first.content);
-  const second = await send({ ...body, model: opus, stream: false, messages: [...body.messages,
+  const second = await send({ ...body, model: `anthropic/${opus}`, stream: false, messages: [...body.messages,
     { role: "assistant", content: first.content },
     { role: "user", content: [...results, { type: "text", text: followUp }] }
   ] });
-  assert.equal(second.model, opus);
+  assert.equal(second.model, `anthropic/${opus}`);
   assert.deepEqual(second.content, [{ type: "text", text: "native reply" }]);
   assert.equal(upstream.length, 2);
   assert.equal(upstream[0].authorization, `Bearer ${codex.token}`);
@@ -269,11 +269,11 @@ test("Opus → Codex keeps visible history and tool results without sending Clau
   const first = await send({ ...body, stream: false });
   assert.equal(first.stop_reason, "tool_use");
   assert.deepEqual(first.content, blocks);
-  const second = await send({ ...body, model: `anthropic/${gpt}`, stream: true, messages: [...body.messages,
+  const second = await send({ ...body, model: `anthropic/openai/${gpt}`, stream: true, messages: [...body.messages,
     { role: "assistant", content: first.content },
     { role: "user", content: [...toolResults(first.content), { type: "text", text: followUp }] }
   ] });
-  assert.equal(second.model, `anthropic/${gpt}`);
+  assert.equal(second.model, `anthropic/openai/${gpt}`);
   assert.equal(second.stop_reason, "end_turn");
   assert.deepEqual(second.content, [{ type: "text", text: "The fixture was read." }]);
   assert.equal(upstream.length, 2);

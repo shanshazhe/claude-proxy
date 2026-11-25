@@ -82,7 +82,7 @@ async function runCli({ requestGpt, searchResponses = async () => { throw new Er
       const child = promisify(execFile)("claude", [
         "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
         ...(followUpPrompts.length ? [] : ["--no-session-persistence"]),
-        "--model", "anthropic/gpt-5.4", "--debug-file", path.join(directory, "debug.log"), "--output-format", "json", ...promptArgs
+        "--model", "anthropic/openai/gpt-5.4", "--debug-file", path.join(directory, "debug.log"), "--output-format", "json", ...promptArgs
       ], { cwd: directory, env, timeout: 90000, maxBuffer: 1024 * 1024 });
       child.child.stdin.end();
       const { stdout } = await child;
@@ -120,7 +120,7 @@ test("installed Claude CLI sends selected GPT and gateway serves discovery URL",
   assert.equal(result.is_error, false);
   assert.equal(result.result, "gateway-smoke-ok");
   assert.ok(observed.includes("gpt-5.4"));
-  assert.ok(models.data.some((entry) => entry.id === "anthropic/gpt-5.4"));
+  assert.ok(models.data.some((entry) => entry.id === "anthropic/openai/gpt-5.4"));
 });
 
 // The built-in tool sends its own web_search_20250305 request (tool_choice auto on the wire); its links must reach
@@ -219,7 +219,7 @@ for (const mode of ["threshold", "context-error", "oversized-summary"]) {
 // A local Anthropic endpoint serves the catalog and stands in for the gateway, so every turn stays offline.
 test("launcher applies a fixed GPT window across GPT/Claude switching; compaction runs on the next turn", { skip, timeout: 200000 }, async () => {
   const summaryMarker = "Your task is to create a detailed summary of the conversation so far";
-  const catalog = { object: "list", data: [{ id: "anthropic/gpt-6.1-sol", owned_by: "openai", api: "openai-responses", context_window: 872000 },
+  const catalog = { object: "list", data: [{ id: "anthropic/openai/gpt-6.1-sol", owned_by: "openai", api: "openai-responses", context_window: 872000 },
     { id: "claude-opus-5.5", owned_by: "github-copilot", api: "anthropic-messages", context_window: 1000000 }] };
   let inputTokens = 1000;
   const requests = [];
@@ -269,7 +269,7 @@ test("launcher applies a fixed GPT window across GPT/Claude switching; compactio
     Object.assign(env, { ANTHROPIC_BASE_URL: `http://127.0.0.1:${server.address().port}`, ANTHROPIC_API_KEY: "test-only" });
     // Settings-only launch: the model comes solely from user settings, with no ANTHROPIC_MODEL or --model.
     if (settingsOnly) fs.writeFileSync(path.join(directory, "settings.json"), JSON.stringify({ model: "gpt-6.1-sol" }));
-    else env.ANTHROPIC_MODEL = "anthropic/gpt-6.1-sol[1m]";
+    else env.ANTHROPIC_MODEL = "anthropic/openai/gpt-6.1-sol[1m]";
     const child = require("child_process").spawn(process.execPath, [path.resolve("lib/claude-launch.js"), "-p", "--input-format", "stream-json",
       "--output-format", "stream-json", "--verbose", "--setting-sources", "user", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
       "--no-session-persistence", "--tools", ""], { cwd: directory, env });
@@ -298,7 +298,7 @@ test("launcher applies a fixed GPT window across GPT/Claude switching; compactio
     try {
       const turns = [await turn("turn-1", 1000)];
       if (settingsOnly) return turns;
-      await setModel("claude-opus-5.5[1m]");
+      await setModel("anthropic/claude-opus-5.5[1m]");
       turns.push(await turn("turn-2", 900000));
       if (switchBack) await setModel("gpt-6.1-sol");
       turns.push(await turn("turn-3", 1000));
@@ -307,8 +307,8 @@ test("launcher applies a fixed GPT window across GPT/Claude switching; compactio
   };
   try {
     const switched = await run(true);
-    assert.deepEqual(switched[0].windows, { "anthropic/gpt-6.1-sol": 872000 });
-    assert.deepEqual(switched[1].windows, { "anthropic/gpt-6.1-sol": 872000, "claude-opus-5.5[1m]": 1000000 });
+    assert.deepEqual(switched[0].windows, { "anthropic/openai/gpt-6.1-sol": 872000 });
+    assert.deepEqual(switched[1].windows, { "anthropic/openai/gpt-6.1-sol": 872000, "anthropic/claude-opus-5.5": 1000000 });
     assert.deepEqual(switched[1].requests.map((row) => row.summary), [false], "900K fits Opus's declared 1M window");
     assert.ok(switched[2].requests.some((row) => row.summary), "900K exceeds GPT's 872K window: " + JSON.stringify(switched[2].requests));
     assert.deepEqual(switched[2].requests.at(-1), { model: "gpt-6.1-sol", summary: false });

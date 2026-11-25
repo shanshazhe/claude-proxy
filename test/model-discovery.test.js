@@ -1,7 +1,9 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { createModelDiscovery } = require("../lib/model-discovery");
+const { createModelDiscovery: createDiscovery } = require("../lib/model-discovery");
 
+// These fixtures cover Codex and Copilot only; never read a developer's NVIDIA key.
+const createModelDiscovery = (options) => createDiscovery({ env: {}, store: { readAuth: () => ({}) }, ...options });
 const ok = (data) => ({ ok: true, json: async () => data });
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -145,6 +147,34 @@ test("waitForRefresh waits beyond the reply deadline and coalesces mixed callers
   assert.equal(calls, 2);
 });
 
+test("fast GPT and Copilot catalogs are visible before slow NVIDIA discovery completes", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const getModels = createModelDiscovery({
+    env: { NVIDIA_API_KEY: "fixture-nvidia" },
+    loadAuth: async () => ({ kind: "api", token: "fixture-openai" }),
+    loadClaudeAuth: async () => ({ token: "fixture-copilot", baseUrl: "https://api.business.githubcopilot.com" }),
+    fetchImpl: async (url) => {
+      if (url.includes("nvidia.com")) {
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        return ok({ data: [{ id: "z-ai/glm-5.3-flash" }] });
+      }
+      if (url.includes("githubcopilot.com")) return ok({ data: [
+        { id: "claude-sonnet-4", model_picker_enabled: true, supported_endpoints: ["/v1/messages"] }
+      ] });
+      return ok({ data: [{ id: "gpt-5.4", supported_endpoints: ["/responses"] }] });
+    }
+  });
+  await require("../lib/pi-registry").loadPiModels();
+  const ordinary = getModels();
+  const complete = getModels({ waitForRefresh: true });
+  await flush();
+  t.mock.timers.tick(2200);
+  const early = await ordinary;
+  t.mock.timers.tick(2800);
+  assert.deepEqual((await complete).data.map(({ id }) => id), ["gpt-5.4", "claude-sonnet-4", "z-ai/glm-5.3-flash"]);
+  assert.deepEqual(early.data.map(({ id }) => id), ["gpt-5.4", "claude-sonnet-4"]);
+});
+
 test("default discovery returns stale cache while waitForRefresh awaits its refresh", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   let clock = 0;
@@ -237,7 +267,7 @@ test("invalidation refreshes immediately and an older pending catalog cannot res
   const fresh = await getModels();
   assert.equal(fresh.data[0].id, "gpt-2.4");
   release();
-  await old;
+  assert.strictEqual(await old, fresh);
   assert.equal((await getModels()).data[0].id, "gpt-2.4");
   assert.equal(calls, 2);
   getModels.invalidate();

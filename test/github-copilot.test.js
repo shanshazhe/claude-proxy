@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { PassThrough } = require("node:stream");
+const http = require("node:http");
 const { forwardClaudeCount, getCopilotHeaders, discoverCopilotModels, listCopilotResponsesModels, loadCopilotResponsesAuth } = require("../lib/github-copilot");
 const { requestClaude } = require("../lib/pi-claude");
 const { claudeEvents, claudeSse } = require("./helpers/claude-fixture");
@@ -262,21 +263,31 @@ test("Copilot retries only rejected disabled thinking and remembers the accepted
   assert.equal(calls, 1);
 });
 
-test("Claude rejects incomplete/error SSE and forwards cancellation to the upstream reader", async () => {
+test("Claude rejects incomplete/error SSE", async () => {
   await assert.rejects(request({}, { fetchImpl: async () => claudeSse(claudeEvents().slice(0, -1)) }), /message_stop/);
   await assert.rejects(request({}, { fetchImpl: async () => claudeSse([{ type: "error", error: { type: "overloaded_error", message: "overloaded" } }]) }),
     (error) => error.status === 502 && error.body?.error.type === "overloaded_error");
+});
+
+test("Pi closes the Copilot HTTP stream when the client disconnects", { timeout: 5000 }, async (t) => {
+  let closed;
+  const upstreamClosed = new Promise((resolve) => { closed = resolve; });
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.once("close", closed);
+      const start = claudeEvents()[0];
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(`event: ${start.type}\ndata: ${JSON.stringify(start)}\n\n`);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
   const control = {};
-  let signal, canceled = false;
-  const pending = request({}, { control, onResponse: () => control.abort("client closed", 499), fetchImpl: async (_, options) => {
-    signal = options.signal;
-    const start = claudeEvents()[0];
-    return new Response(new ReadableStream({ start(target) { target.enqueue(Buffer.from(`event: ${start.type}\ndata: ${JSON.stringify(start)}\n\n`)); },
-      cancel() { canceled = true; } }), { headers: { "content-type": "text/event-stream" } });
-  } });
-  await assert.rejects(pending, { status: 499, message: "client closed" });
-  assert.equal(signal.aborted, true);
-  assert.equal(canceled, true);
+  await assert.rejects(request({}, { control, fetchImpl: fetch,
+    loadAuth: async () => ({ ...auth, baseUrl: `http://127.0.0.1:${server.address().port}` }),
+    onResponse: () => control.abort("client closed", 499) }), { status: 499, message: "client closed" });
+  await upstreamClosed;
 });
 
 test("Copilot remembers /responses models for web search and builds Responses auth without Anthropic headers", async () => {

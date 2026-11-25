@@ -16,11 +16,26 @@ function fixture(t, options = {}) {
     cleanup() { state.cleaned++; }, isConfigured: (statusLine) => statusLine?.command === "test-statusline-command" };
   const base = { configRoot: root, env: {}, store, installer, platform: "darwin",
     probe: async () => { state.probes++; return { cli: true, bash: "/bin/bash", jq: "/bin/jq", node: process.execPath }; },
-    getAvailableModels: async () => { state.catalogs++; return { data: [{ id: "gpt-test", owned_by: "openai", api: "openai-responses" }] }; } };
+    getGptModels: async () => { state.catalogs++; return { data: [{ id: "gpt-test", owned_by: "openai", api: "openai-responses" }] }; } };
   const setup = createClaudeSetup({ ...base, ...options });
   return { root, settingsFile, state, base, setup, read: () => JSON.parse(fs.readFileSync(settingsFile, "utf8")),
     write: (value) => fs.writeFileSync(settingsFile, typeof value === "string" ? value : JSON.stringify(value)) };
 }
+test("Configure Claude CLI accepts NVIDIA-only setup without saving a key or model", async (t) => {
+  const f = fixture(t, { env: { NVIDIA_API_KEY: "fixture-nvidia-only" } });
+  f.state.auth = {};
+  assert.equal((await f.setup.getStatus()).claudeCli.ready, true);
+  const result = await f.setup.configureCli();
+  assert.equal(result.success, true);
+  assert.equal(result.model, undefined);
+  assert.equal(f.read().env.ANTHROPIC_MODEL, undefined);
+  assert.equal(f.read().model, undefined);
+  assert.equal(f.state.catalogs, 0);
+  assert.equal((await f.setup.getStatus()).claudeCli.configured, true);
+  assert.ok(!fs.readFileSync(f.settingsFile, "utf8").includes("fixture-nvidia-only"));
+  assert.equal((await f.setup.syncGptContextCapacity()).skipped, true);
+});
+
 test("GPT post-login capacity sync saves the largest valid GPT window with an exact backup and no unrelated changes", async (t) => {
   const f = fixture(t);
   const original = { env: { KEEP: "yes", ANTHROPIC_MODEL: "anthropic/gpt-small", ANTHROPIC_BASE_URL: "https://unchanged.test",
@@ -28,8 +43,7 @@ test("GPT post-login capacity sync saves the largest valid GPT window with an ex
   const bytes = Buffer.from("﻿" + JSON.stringify(original, null, 4) + "\n");
   fs.writeFileSync(f.settingsFile, bytes);
   let discoveries = 0;
-  const setup = createClaudeSetup({ ...f.base, getAvailableModels: async () => assert.fail("must use the GPT-only catalog"),
-    getGptModels: async (options) => {
+  const setup = createClaudeSetup({ ...f.base, getGptModels: async (options) => {
       discoveries++;
       assert.deepEqual(options, { waitForRefresh: true });
       return { data: [
@@ -190,13 +204,13 @@ for (const platform of ["darwin", "win32"]) {
       featureFile: path.join(home, "features.json"),
       execFileSync: (_file, args) => args.at(-1).includes("$PROFILE.CurrentUserAllHosts") ? profile : process.version });
     const setup = createClaudeSetup({ configRoot, env: {}, store, launcherInstaller,
-      probe: async () => ({ cli: true }), getAvailableModels: async () => ({ data: [{ id: "gpt-sol-test", owned_by: "openai", api: "openai-responses", context_window: 872000 }] }) });
+      probe: async () => ({ cli: true }) });
     assert.equal(await launcherInstaller.autoEnable(), null);
     assert.equal(fs.existsSync(profile), false);
     assert.equal((await setup.getStatus()).claudeCli.ready, false);
     assert.equal(fs.existsSync(profile), false);
     auth.openai = { type: "api_key", key: "test-login-key" };
-    assert.equal((await setup.configureCli()).model, "anthropic/gpt-sol-test");
+    assert.equal((await setup.configureCli()).success, true);
     assert.match(fs.readFileSync(profile, "utf8"), /claude-launch\.js/);
     const settings = JSON.parse(fs.readFileSync(path.join(configRoot, "settings.json")));
     assert.equal(settings.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, undefined);
@@ -218,7 +232,7 @@ test("CLI configuration keeps routing and reports a safe notice when capacity la
     let calls = 0;
     const f = fixture(t, { launcherInstaller: { async autoEnable() {
       calls++;
-      assert.equal(f.read().env.ANTHROPIC_MODEL, "anthropic/gpt-test");
+      assert.equal(f.read().env.ANTHROPIC_BASE_URL, "http://localhost:8082");
       if (outcome instanceof Error) throw outcome;
       return outcome;
     } } });
@@ -254,16 +268,18 @@ test("read-only status uses cached probes, never models or configuration writes,
 test("merge preserves unrelated settings, backs up original BOM bytes privately and retries idempotently", async (t) => {
   const f = fixture(t);
   const unrelated = { env: { OTHER: "unchanged", ANTHROPIC_API_KEY: "old-secret", ANTHROPIC_AUTH_TOKEN: "old-token",
+    ANTHROPIC_MODEL: "anthropic/user-override",
     ANTHROPIC_DEFAULT_HAIKU_MODEL: "sonnet", CLAUDE_CODE_SUBAGENT_MODEL: "opus" },
     hooks: { Stop: [{ hooks: [{ type: "command", command: "true" }] }] }, permissions: { allow: ["Read"] },
     enabledPlugins: { "other@local": true }, model: "old-model", statusLine: { type: "command", command: "old-script" } };
   const original = Buffer.from("﻿" + JSON.stringify(unrelated, null, 4) + "\n");
   fs.writeFileSync(f.settingsFile, original);
   const result = await f.setup.configureCli();
-  assert.equal(result.model, "anthropic/gpt-test");
+  assert.equal(result.model, undefined);
+  assert.equal(f.state.catalogs, 0);
   const saved = f.read();
   for (const key of ["hooks", "permissions", "enabledPlugins", "model", "statusLine"]) assert.deepEqual(saved[key], unrelated[key]);
-  for (const key of ["OTHER", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"]) assert.equal(saved.env[key], unrelated.env[key]);
+  for (const key of ["OTHER", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"]) assert.equal(saved.env[key], unrelated.env[key]);
   assert.equal(saved.env.ANTHROPIC_AUTH_TOKEN, undefined);
   assert.equal(saved.env.ANTHROPIC_API_KEY, "sk-placeholder");
   const backupDir = path.join(f.root, "claude-proxy", "settings-backups");
@@ -319,17 +335,18 @@ test("distinct setup instances serialize latest-settings merges", async (t) => {
   assert.equal(f.read().env.KEEP, "yes");
 });
 
-test("external edits during model lookup are merged and latest auth conflicts abort", async (t) => {
+test("external edits during the CLI probe are merged and latest auth conflicts abort", async (t) => {
   const f = fixture(t);
-  const setup = createClaudeSetup({ ...f.base, getAvailableModels: async () => {
+  const setup = createClaudeSetup({ ...f.base, probe: async () => {
     f.write({ env: { EXTERNAL: "latest" }, permissions: { deny: ["Bash"] } });
-    return { data: [{ id: "gpt-test", owned_by: "openai", api: "openai-responses" }] };
+    return { cli: true };
   } });
   await setup.configureCli();
   assert.equal(f.read().env.EXTERNAL, "latest");
   assert.deepEqual(f.read().permissions, { deny: ["Bash"] });
-  const conflicted = createClaudeSetup({ ...f.base, getAvailableModels: async () => {
-    f.write({ apiKeyHelper: "private-helper" }); return { data: [{ id: "gpt-test", owned_by: "openai", api: "openai-responses" }] };
+  const conflicted = createClaudeSetup({ ...f.base, probe: async () => {
+    f.write({ apiKeyHelper: "private-helper" });
+    return { cli: true };
   } });
   await assert.rejects(conflicted.configureCli(), /apiKeyHelper/);
   assert.deepEqual(f.read(), { apiKeyHelper: "private-helper" });
@@ -355,36 +372,27 @@ test("target changes at final validation cause conflict rather than lost externa
   assert.deepEqual(f.read(), { external: true });
 });
 for (const provider of ["openai-codex", "github-copilot", "environment"]) {
-  test(`chooses only credential-matching catalog models for ${provider}`, async (t) => {
-    const f = fixture(t); f.state.auth = {};
+  test(`configures routing without picking a model for ${provider}`, async (t) => {
+    const f = fixture(t, { env: provider === "environment" ? { OPENAI_API_KEY: "env-only-secret" } : {} });
+    f.state.auth = {};
     if (provider !== "environment") f.state.auth[provider] = { type: "oauth", access: "test-access", refresh: "test-refresh", expires: 0 };
-    const expected = provider === "github-copilot" ? "claude-opus-5-5" : "gpt-test";
-    const setup = createClaudeSetup({ ...f.base, env: provider === "environment" ? { OPENAI_API_KEY: "env-only-secret" } : {},
-      getAvailableModels: async () => ({ data: [{ id: "unsupported-model" }, { id: "gpt-test", owned_by: "openai", api: "openai-responses" }, { id: "claude-opus-5-5", owned_by: "github-copilot", api: "anthropic-messages" }] }) });
-    f.write({ env: { ANTHROPIC_MODEL: "anthropic/vendor/stale" } });
-    const result = await setup.configureCli();
-    assert.equal(result.model.replace(/\[1m\]$/, ""), provider === "github-copilot" ? expected : `anthropic/${expected}`);
+    assert.equal((await f.setup.configureCli()).success, true);
+    assert.equal(f.read().env.ANTHROPIC_MODEL, undefined);
+    assert.equal(f.state.catalogs, 0);
     assert.ok(!JSON.stringify(f.read()).includes("env-only-secret"));
     assert.equal(f.read().env.CLAUDE_CODE_SUBAGENT_MODEL, undefined);
     assert.equal(f.read().env.ANTHROPIC_DEFAULT_HAIKU_MODEL, undefined);
   });
 }
 
-test("preserves the latest available model choice including extended context gateway spelling", async (t) => {
-  const f = fixture(t);
-  f.write({ env: { ANTHROPIC_MODEL: "anthropic/gpt-second" } });
-  const setup = createClaudeSetup({ ...f.base, getAvailableModels: async () => ({ data: [{ id: "gpt-first", owned_by: "openai", api: "openai-responses" }, { id: "gpt-second", owned_by: "openai", api: "openai-responses" }] }) });
-  assert.equal((await setup.configureCli()).model, "anthropic/gpt-second");
-});
-
-test("empty or failed catalogs and vanished credentials never write settings", async (t) => {
+test("credentials removed during the CLI probe prevent saving settings", async (t) => {
   const f = fixture(t); f.write({ untouched: true });
-  for (const getAvailableModels of [async () => ({ data: [] }), async () => { throw new Error("upstream-secret"); },
-    async () => { f.state.auth = {}; return { data: [{ id: "gpt-test", owned_by: "openai", api: "openai-responses" }] }; }]) {
-    const setup = createClaudeSetup({ ...f.base, getAvailableModels });
-    await assert.rejects(setup.configureCli());
-    assert.deepEqual(f.read(), { untouched: true });
-  }
+  const setup = createClaudeSetup({ ...f.base, probe: async () => {
+    f.state.auth = {};
+    return { cli: true };
+  } });
+  await assert.rejects(setup.configureCli(), { setupCode: "no-credentials" });
+  assert.deepEqual(f.read(), { untouched: true });
 });
 
 test("missing CLI and authentication modes have fixed gates without deleting helpers", async (t) => {
