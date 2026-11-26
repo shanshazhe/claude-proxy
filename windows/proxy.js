@@ -555,7 +555,8 @@ async function answerWebSearch(anthropicBody, search, model, requestId, res, cap
       stopKeepAlive = startSseKeepAlive(res, requestId);
     }
     const result = await runWebSearch(anthropicBody, search, { capabilities, control,
-      onCacheUsage: (usage) => logEvent(requestId, "OpenAI prompt cache usage", usage) });
+      onCacheUsage: (usage) => logEvent(requestId, "OpenAI prompt cache usage", usage),
+      onReplayFailure: (counts) => logEvent(requestId, "Codex replay failure", counts) });
     stopKeepAlive();
     logEvent(requestId, "Web search completed", { model: result.model, auth_kind: result.authKind, searches: result.searches, results: result.hits, capped: result.capped });
     const message = toAnthropicMessage(result, model);
@@ -644,7 +645,7 @@ const server = http.createServer(async (req, res) => {
 
   // Handle /v1/messages (Anthropic format) - match with or without query params
   if (req.url.startsWith("/v1/messages") && req.method === "POST") {
-    let body = "";
+    const bodyChunks = [];
     let bodyBytes = 0;
     let bodyTooLarge = false;
 
@@ -658,14 +659,15 @@ const server = http.createServer(async (req, res) => {
         req.destroy();
         return;
       }
-      body += chunk;
+      bodyChunks.push(chunk);
     });
 
     req.on("end", async () => {
       if (bodyTooLarge) return;
       try {
         const readOnly = new URL(req.url, "http://localhost").pathname !== "/v1/messages";
-        const prepared = await onlineSummary.prepare(JSON.parse(body), { readOnly });
+        const body = JSON.parse(Buffer.concat(bodyChunks, bodyBytes).toString("utf8"));
+        const prepared = await onlineSummary.prepare(body, { readOnly });
         if (prepared.stats.packed_results || prepared.stats.recalled_results) {
           logEvent(requestId, "Gateway online summary", prepared.stats);
         }
@@ -707,7 +709,8 @@ const server = http.createServer(async (req, res) => {
           await answerWebSearch(anthropicBody, search, clientModel, requestId, res, capabilities);
           return;
         }
-        const requestOptions = { route, clientHeaders: req.headers, url: req.url };
+        const requestOptions = { route, clientHeaders: req.headers, url: req.url,
+          onReplayFailure: (counts) => logEvent(requestId, "Codex replay failure", counts) };
         if (isStream) {
           // Client wants streaming - bridge unified Pi events to Anthropic SSE.
           streamToClient(anthropicBody, clientModel, requestId, res, responseHandler, requestOptions);

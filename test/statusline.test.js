@@ -68,16 +68,26 @@ test("real launcher renders synthetic context, whole-session token/cache totals 
       PATH: "/usr/bin:/bin", HOME: root, USERPROFILE: root, LANG: "en_US.UTF-8"
     } }));
     const full = invoke({ ...common, transcript_path: transcript });
-    assert.equal(full, "~/project with spaces | Synthetic | ctx: 500/200k (25%) | in: 0.5k out: 0.1k cache: 0.3k hit: 60%\n");
+    assert.equal(full, "Synthetic | ctx: 500/200k (25%) | in: 0.5k out: 0.1k cache: 0.3k hit: 60%\n");
     assert.ok(fs.existsSync(marker));
     const empty = invoke({ cwd, model: { display_name: "Synthetic" } });
-    assert.equal(empty, "~/project with spaces | Synthetic | in: n/a out: n/a cache: n/a hit: n/a\n");
+    assert.equal(empty, "Synthetic | in: n/a out: n/a cache: n/a hit: n/a\n");
+    assert.equal(invoke({ ...common, effort: { level: "high" }, transcript_path: transcript }),
+      full.replace("Synthetic", "Synthetic · effort: high"));
+    for (const effort of [null, { level: "" }, { level: "unknown" }, "high"]) {
+      assert.equal(invoke({ cwd, model: { display_name: "Synthetic" }, effort }), empty);
+    }
     const state = (prompt_cache) => invoke({ cwd, model: { display_name: "Synthetic" }, prompt_cache }).replace(/^.*hit: n\/a/, "").trim();
     const warmCache = { caching_observed: true, warm: true, ttl: "5m", expires_at: 1000300, last_miss_at: 999000 };
     assert.equal(state(warmCache), "(warm)");
     assert.equal(state({ ...warmCache, warm: false, expires_at: null }), "(cold)");
     assert.equal(state({ ...warmCache, ttl: "1h", expires_at: 1003600, last_miss_at: 1000000, last_miss_cause: { causes: ["tools_changed"] } }), "(dropped: tools_changed)");
     assert.equal(state({ ...warmCache, caching_observed: false }), "");
+    execFileSync("git", ["init", "--quiet", "--initial-branch=claude-hud", cwd]);
+    assert.equal(invoke({ cwd, model: { display_name: "Synthetic" } }), `git:(claude-hud) | ${empty}`);
+    const changedFile = path.join(cwd, "changed.txt");
+    fs.writeFileSync(changedFile, "synthetic change\n");
+    assert.equal(invoke({ cwd, model: { display_name: "Synthetic" } }), `git:(claude-hud)* | ${empty}`);
     installer.cleanup(deployment);
   } finally { remove(root); }
 });
@@ -138,12 +148,10 @@ test("Windows command and launcher convert drive paths and quote spaces/apostrop
   } finally { remove(root); }
 });
 
-test("bundled script is the local original plus only the jq adapter and has no personal paths", () => {
-  const crypto = require("node:crypto");
+test("bundled script uses the probed jq adapter and has no personal paths", () => {
   const script = fs.readFileSync(path.join(bundleRoot, "statusline/statusline-command.sh"), "utf8");
-  const adapter = "# Toolkit adapter: use the probed jq binary (the only change from the local original).\njq() { \"${TOOLKIT_JQ:-jq}\" \"$@\"; }\n";
+  const adapter = 'jq() { "${TOOLKIT_JQ:-jq}" "$@"; }';
   assert.equal(script.split(adapter).length, 2);
-  assert.equal(crypto.createHash("sha256").update(script.replace(adapter, "")).digest("hex"), "59c7e57d62f09a09a4b9bfad7d7cbabc4fcfa33f0d4996b08d81d817369b0702");
   assert.doesNotMatch(script, /Users\/[^/]+|CLAUDE_CONFIG_DIR|node/);
   execFileSync("bash", ["-n", path.join(bundleRoot, "statusline/statusline-command.sh")]);
 });

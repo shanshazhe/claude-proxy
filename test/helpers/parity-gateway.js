@@ -29,14 +29,14 @@ function readSource(file, old) {
   return baselineSources.get(file);
 }
 
-async function parityGateway(t, { old, route, routes = [route], auth, loadAuth = async () => auth, fetchImpl }) {
+async function parityGateway(t, { old, route, routes = [route], auth, loadAuth = async () => auth, fetchImpl, onLog = () => {} }) {
   let server;
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-parity-"));
   t.after(() => fs.rmSync(fixtureRoot, { recursive: true, force: true }));
   const noNetwork = () => assert.fail("Unexpected network call outside the injected upstream");
   const sandbox = vm.createContext({ Buffer, URL, Response, TextDecoder, TextEncoder, AbortController, AbortSignal,
     structuredClone, setTimeout, clearTimeout, setInterval, clearInterval, fetch: noNetwork,
-    process: { env: {}, platform: process.platform }, console: { log() {}, warn() {}, error() {} } });
+    process: { env: {}, platform: process.platform }, console: { log: onLog, warn() {}, error() {} } });
   const stubs = new Map([
     ["lib/model-discovery.js", { createModelDiscovery: () => async () => ({ data: routes }) }],
     ["lib/online-summary.js", { createOnlineSummary: () => ({ prepare: async (body) => ({ body, stats: {} }), getStatus: () => ({}) }), createSummarySettings: () => ({}) }],
@@ -94,12 +94,12 @@ async function parityGateway(t, { old, route, routes = [route], auth, loadAuth =
   assert.ok(server);
   await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   t.after(async () => { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); });
-  return async (body) => {
+  return async (body, expectedStatus = 200) => {
     const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/messages`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(5000)
     });
     const text = await response.text();
-    assert.equal(response.status, 200, text);
+    assert.equal(response.status, expectedStatus, text);
     assert.match(response.headers.get("content-type"), body.stream ? /^text\/event-stream/ : /^application\/json/);
     return body.stream ? assembleSse(text) : JSON.parse(text);
   };

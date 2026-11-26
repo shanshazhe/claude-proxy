@@ -27,23 +27,34 @@ test("HUD status reads only Claude's user-scope installation record without runn
   }
 });
 
-test("HUD configuration installs only when needed, enables/disables at user scope and persists state", async (t) => {
+test("HUD on installs and enables it, runs Claude HUD's own install with the layout; off uninstalls", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "hud-toggle-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const calls = [];
   const settingsFile = path.join(root, "settings.json");
-  const options = { configRoot: root, execFileImpl(_file, args, _options, done) {
+  const installPath = path.join(root, "plugins", "cache", "claude-hud", "claude-hud", "0.15.3");
+  const registry = (records) => fs.writeFileSync(path.join(root, "plugins", "installed_plugins.json"), JSON.stringify({ plugins: records }));
+  const readSettings = () => JSON.parse(fs.readFileSync(settingsFile, "utf8"));
+  const options = { configRoot: root, node: "C:\\node\\node.exe", execFileImpl(file, args, _options, done) {
+    if (file === "C:\\node\\node.exe") {
+      calls.push(args.slice(1).join(" "));
+      assert.equal(args[0], path.join(installPath, "hud.mjs"));
+      // Stand-in for Claude HUD's installer: launcher files plus its Git Bash statusLine command.
+      fs.mkdirSync(path.join(root, "plugins", "claude-hud"), { recursive: true });
+      fs.writeFileSync(settingsFile, JSON.stringify({ ...readSettings(), statusLine: { type: "command",
+        command: 'exec "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/claude-hud/statusline.cmd"' } }));
+      return done(null);
+    }
     const operation = args[command.args.length + 1];
     calls.push(operation);
     if (operation === "install") {
       fs.mkdirSync(path.join(root, "plugins"), { recursive: true });
-      fs.writeFileSync(path.join(root, "plugins", "installed_plugins.json"), JSON.stringify({ plugins: {
-        "claude-hud@claude-hud": [{ scope: "user" }]
-      } }));
+      registry({ "claude-hud@claude-hud": [{ scope: "user", installPath }] });
     }
-    if (["enable", "disable"].includes(operation)) {
+    if (operation === "uninstall") registry({});
+    if (["enable", "disable", "uninstall"].includes(operation)) {
       assert.deepEqual(args.slice(-2), ["--scope", "user"]);
-      fs.writeFileSync(settingsFile, JSON.stringify({ enabledPlugins: { "claude-hud@claude-hud": operation === "enable" } }));
+      fs.writeFileSync(settingsFile, JSON.stringify({ env: { KEEP: "yes" }, enabledPlugins: { "claude-hud@claude-hud": operation === "enable" } }));
     }
     done(null);
   } };
@@ -52,11 +63,38 @@ test("HUD configuration installs only when needed, enables/disables at user scop
   assert.equal((await installer.configure({ claudeCommand: command }, true)).enabled, true);
   assert.equal(installer.isEnabled(), true);
   assert.equal(createClaudeHudInstaller(options).isEnabled(), true);
+  // One command for both shells Claude Code may use: an unquoted forward-slash path to the .cmd launcher.
+  const launcher = path.join(root, "plugins", "claude-hud", "statusline.cmd").replace(/\\/g, "/");
+  assert.deepEqual(readSettings().statusLine, { type: "command", command: launcher });
+  assert.equal(readSettings().env.KEEP, "yes");
+  assert.equal(isClaudeHudCommand(launcher, { configRoot: root }), true);
+  assert.deepEqual(fs.readFileSync(path.join(root, "plugins", "claude-hud", "config.json")),
+    fs.readFileSync(path.join(__dirname, "..", "claudehud", "config.json")));
   assert.equal((await installer.configure({ claudeCommand: command }, false)).enabled, false);
-  assert.equal(installer.isInstalled(), true);
-  assert.equal(installer.isEnabled(), false);
+  assert.deepEqual([installer.isInstalled(), installer.isEnabled()], [false, false]);
   await installer.configure({ claudeCommand: command }, true);
-  assert.deepEqual(calls, ["marketplace", "install", "enable", "disable", "enable"]);
+  assert.deepEqual(calls, ["marketplace", "install", "enable", "install --replace --shell gitbash", "uninstall",
+    "marketplace", "install", "enable", "install --replace --shell gitbash"]);
+  fs.writeFileSync(settingsFile, JSON.stringify({ enabledPlugins: { "claude-hud@claude-hud": true } }));
+  await installer.configure({ claudeCommand: command }, true);
+  assert.equal(calls.at(-2), "install --replace --shell gitbash", "an installed, enabled plugin is not reinstalled or re-enabled");
+  assert.equal(calls.length, 10);
+  registry({});
+  await installer.configure({ claudeCommand: command }, false);
+  assert.equal(calls.length, 10, "nothing to uninstall");
+});
+
+test("HUD refuses a config path with spaces instead of writing a command a shell would split", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "hud spaced "));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, "plugins"), { recursive: true });
+  fs.writeFileSync(path.join(root, "plugins", "installed_plugins.json"), JSON.stringify({ plugins: {
+    "claude-hud@claude-hud": [{ scope: "user", installPath: path.join(root, "hud") }] } }));
+  fs.writeFileSync(path.join(root, "settings.json"), JSON.stringify({ enabledPlugins: { "claude-hud@claude-hud": true } }));
+  const before = fs.readFileSync(path.join(root, "settings.json"));
+  const installer = createClaudeHudInstaller({ configRoot: root, execFileImpl() { assert.fail("must not run anything"); } });
+  await assert.rejects(installer.configure({ claudeCommand: command }, true), { setupCode: "hud-configure" });
+  assert.deepEqual(fs.readFileSync(path.join(root, "settings.json")), before);
 });
 
 test("HUD launcher recognition covers official relative commands and user registry paths only", (t) => {

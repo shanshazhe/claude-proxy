@@ -1,19 +1,16 @@
 #!/bin/bash
 # Claude Code status line
-# Shows: cwd (abbreviated with ~), git branch + dirty marker, model name, context usage (tokens used/total + %),
+# Shows: git branch + dirty marker, model name, session effort, context usage (tokens used/total + %),
 #        whole-session cumulative in/out/cache tokens + prompt cache hit % + cache state (warm/cold/dropped)
 
-# Toolkit adapter: use the probed jq binary (the only change from the local original).
+# Toolkit adapter: use the probed jq binary.
 jq() { "${TOOLKIT_JQ:-jq}" "$@"; }
 input=$(cat)
 
-# --- Current working directory, abbreviated with ~ ---
-cwd=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // empty')
-dir_display=${cwd/#$HOME/\~}
-
 # --- Git branch + dirty marker ---
+cwd=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // empty')
 git_info=""
-if git -C "$cwd" --no-optional-locks rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if [ -n "$cwd" ] && git -C "$cwd" --no-optional-locks rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   branch=$(git -C "$cwd" --no-optional-locks symbolic-ref --short HEAD 2>/dev/null)
   if [ -z "$branch" ]; then
     branch=$(git -C "$cwd" --no-optional-locks rev-parse --short HEAD 2>/dev/null)
@@ -24,12 +21,17 @@ if git -C "$cwd" --no-optional-locks rev-parse --is-inside-work-tree >/dev/null 
     else
       dirty=""
     fi
-    git_info=" \033[2m|\033[0m \033[36m${branch}${dirty}\033[0m"
+    git_info="git:(${branch})${dirty}"
   fi
 fi
 
-# --- Model name ---
-model=$(echo "$input" | jq -r '.model.display_name // empty')
+# --- Model name and session effort ---
+model=$(echo "$input" | jq -r '
+  (try .effort.level catch null) as $effort
+  | (.model.display_name // "") as $model
+  | if $effort == "low" or $effort == "medium" or $effort == "high" or $effort == "xhigh" or $effort == "max"
+    then ($model | if . == "" then "" else . + " · " end) + "effort: " + $effort
+    else $model end')
 
 # --- Context usage: actual token counts + percentage ---
 # Format a token count compactly: 1234 -> 1.2k, 200000 -> 200k, 1000000 -> 1M
@@ -133,4 +135,7 @@ case "$cache_state" in
   dropped*) cache_info="${cache_info} \033[31m(${cache_state})\033[0m" ;;
 esac
 
-printf "\033[2m%s\033[0m%b \033[2m|\033[0m \033[2m%s\033[0m%b%b\n" "$dir_display" "$git_info" "$model" "$ctx_info" "$cache_info"
+if [ -n "$git_info" ]; then
+  printf '\033[36m%s\033[0m \033[2m|\033[0m ' "$git_info"
+fi
+printf "\033[2m%s\033[0m%b%b\n" "$model" "$ctx_info" "$cache_info"
