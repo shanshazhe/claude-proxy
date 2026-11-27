@@ -4,10 +4,14 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createModelDiscovery } = require("../lib/model-discovery");
 const { toGatewayModels } = require("../lib/model-routing");
-const { requestPiModel } = require("../lib/pi-model");
+const { requestPiModel: requestModel } = require("../lib/pi-model");
 const { getModelCapabilities } = require("../lib/pi-capabilities");
 const { getGatewayModel } = require("../lib/pi-registry");
 const { parityGateway } = require("./helpers/parity-gateway");
+const { chatSse } = require("./helpers/pi-fixture");
+
+// Pacing behavior is exercised separately with a controlled clock.
+const requestPiModel = (body, options) => requestModel(body, { ...options, pace: async () => {} });
 
 const base = "https://integrate.api.nvidia.com/v1";
 const key = "fixture-nvidia-key";
@@ -163,28 +167,14 @@ test("an older NVIDIA refresh cannot publish after a credential change", async (
   assert.strictEqual(await readFull(), latest);
 });
 
-function chatSse(delta, finish) {
-  const chunk = (choices, usage) => ({ id: "chat_nvidia", object: "chat.completion.chunk", choices, ...(usage && { usage }) });
-  const events = [chunk([{ index: 0, delta, finish_reason: null }]),
-    chunk([{ index: 0, delta: {}, finish_reason: finish }]), chunk([], { prompt_tokens: 100, completion_tokens: 10 })];
-  return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n",
-    { headers: { "Content-Type": "text/event-stream" } });
-}
-
 for (const id of [glm, nemotron]) {
   test(`${id} streams a tool call and accepts its result via the gateway`, async (t) => {
-    const previousKey = process.env.NVIDIA_API_KEY;
-    process.env.NVIDIA_API_KEY = key;
-    t.after(() => {
-      if (previousKey === undefined) delete process.env.NVIDIA_API_KEY;
-      else process.env.NVIDIA_API_KEY = previousKey;
-    });
     const route = { id, owned_by: "nvidia", api: "openai-completions" };
     const tools = [{ name: "lookup", description: "Lookup synthetic fixture", input_schema: {
       type: "object", properties: { id: { type: "string" }, note: { type: "string" } }, required: ["id"]
     } }];
     const seen = [];
-    const send = await parityGateway(t, { route, fetchImpl: async (url, options) => {
+    const send = await parityGateway(t, { route, piOptions: { apiKey: key }, fetchImpl: async (url, options) => {
       assert.equal(url, `${base}/chat/completions`);
       assert.equal(new Headers(options.headers).get("authorization"), `Bearer ${key}`);
       const payload = JSON.parse(options.body);
@@ -314,7 +304,7 @@ test("NVIDIA pacing does not release a backlog together after a delayed timer", 
   assert.deepEqual(sent, [12000, 12600]);
 });
 
-test("NVIDIA 429 fails only its own request without retrying or changing the next request's turn", async () => {
+test("NVIDIA 429 does not retry, cancel concurrent requests, or disrupt key rotation", async () => {
   const route = { id: glm, owned_by: "nvidia", api: "openai-completions" };
   const body = { model: glm, messages: [{ role: "user", content: "hi" }] };
   const store = { readAuth: () => ({ nvidia: { keys: [

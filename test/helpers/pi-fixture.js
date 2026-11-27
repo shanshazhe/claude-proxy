@@ -26,4 +26,13 @@ function sse(events, fragmented = false) {
 function payloadOf(options) {
   return JSON.parse(new Headers(options.headers).get("content-encoding") === "zstd" ? zlib.zstdDecompressSync(options.body).toString() : options.body);
 }
-module.exports = { eventsFor, sse, payloadOf, jwt, text };
+
+function chatSse(delta, finish) {
+  const chunk = (choices, usage) => ({ id: "chat_nvidia", object: "chat.completion.chunk", choices, ...(usage && { usage }) });
+  const events = [chunk([{ index: 0, delta, finish_reason: null }]),
+    chunk([{ index: 0, delta: {}, finish_reason: finish }]), chunk([], { prompt_tokens: 100, completion_tokens: 10 })];
+  return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n",
+    { headers: { "Content-Type": "text/event-stream" } });
+}
+
+module.exports = { eventsFor, sse, chatSse, payloadOf, jwt, text };

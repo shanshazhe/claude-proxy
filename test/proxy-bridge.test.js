@@ -6,6 +6,9 @@ const path = require("path");
 const vm = require("vm");
 const { createRequire } = require("module");
 const { EventEmitter } = require("events");
+const safeguards = [{ type: "dangerous_tool_use" }];
+const emptyReview = [{ type: "dangerous_tool_use", status: { type: "available", tool_uses: {} } }];
+
 async function gptResult(body, options, content, usage, stopReason = "end_turn") {
   const native = body.model.startsWith("claude-");
   const message = { id: "msg_fixture", type: "message", role: "assistant", model: native ? body.model : `anthropic/${body.model}`,
@@ -43,11 +46,15 @@ for (const platform of ["mac", "windows"]) for (const model of ["gpt-5.4", "clau
     let mixed = false;
     let accepted = true;
     const enqueued = [];
+    const flagged = { type: "evaluated", outcome: "flagged", explanation: "Fixture denial" };
     const mockGpt = async (body, options) => {
       const calls = [{ type: "tool_use", id: `memory_${requests++}`, name: "ProjectMemoryUpdate", input: { root: "/repo", changed_paths: [] } }];
       if (mixed) calls.push({ type: "tool_use", id: "read_1", name: "Read", input: {} });
-      return gptResult(body, options, [{ type: "text", text: "Done." }, ...calls],
+      const result = await gptResult(body, options, [{ type: "text", text: "Done." }, ...calls],
         { input_tokens: 50, output_tokens: 20, cache_read_input_tokens: 50 }, "tool_use");
+      return { ...result, safeguard_results: [{ type: "dangerous_tool_use", status: {
+        type: "available", tool_uses: Object.fromEntries(calls.map(({ id }) => [id, flagged]))
+      } }] };
     };
     const context = {
       require: (name) => name === "../lib/online-summary" ? { ...nativeRequire(name),
@@ -64,7 +71,7 @@ for (const platform of ["mac", "windows"]) for (const model of ["gpt-5.4", "clau
       setTimeout, clearTimeout, setInterval, clearInterval
     };
     vm.runInNewContext(fs.readFileSync(filename, "utf8").split("\nsyncClaudeSettings();")[0], context, { filename });
-    const send = async (stream) => {
+    const send = async (stream, mockVerdicts) => {
       const request = new EventEmitter();
       Object.assign(request, { method: "POST", url: "/v1/messages", headers: {} });
       const response = new EventEmitter();
@@ -78,20 +85,31 @@ for (const platform of ["mac", "windows"]) for (const model of ["gpt-5.4", "clau
       }; });
       await route(request, response);
       request.emit("data", Buffer.from(JSON.stringify({ model, stream, tools: [{ name: "Edit", input_schema: { type: "object" } }],
+        safeguards: mockVerdicts ? safeguards : undefined,
         messages: [{ role: "user", content: "edit" }] })));
       request.emit("end");
       return done;
     };
     for (const stream of [false, true]) {
-      for (const hasOtherTool of [false, true]) {
+      for (const hasOtherTool of [false, true]) for (const mockVerdicts of [false, true]) {
         mixed = hasOtherTool;
-        const raw = await send(stream);
+        const raw = await send(stream, mockVerdicts);
         assert.ok(!raw.includes("ProjectMemoryUpdate"));
         assert.ok(raw.includes("Queued."));
         assert.ok(raw.includes("Done."));
-        const value = stream ? raw.split("\n\n").filter((entry) => entry.startsWith("event:"))
-          .map((entry) => JSON.parse(entry.split("\ndata: ")[1])).find((entry) => entry.type === "message_delta") : JSON.parse(raw);
-        assert.equal(stream ? value.delta.stop_reason : value.stop_reason, mixed ? "tool_use" : "end_turn");
+        const events = stream ? raw.split("\n\n").filter((entry) => entry.startsWith("event:"))
+          .map((entry) => JSON.parse(entry.split("\ndata: ")[1])) : null;
+        const value = events ? events.find((entry) => entry.type === "message_delta") : JSON.parse(raw);
+        const result = stream ? value.delta : value;
+        const content = events ? events.filter((event) => event.type === "content_block_start")
+          .map((event) => event.content_block) : value.content;
+        const toolIds = content.filter((block) => block.type === "tool_use").map((block) => block.id);
+        assert.deepEqual(toolIds, mixed ? ["read_1"] : []);
+        const verdicts = result.safeguard_results[0].status.tool_uses;
+        assert.deepEqual(Object.keys(verdicts), toolIds);
+        if (mixed && mockVerdicts) assert.equal(verdicts.read_1.outcome, "not_flagged");
+        if (mixed && !mockVerdicts) assert.deepEqual(verdicts.read_1, flagged);
+        assert.equal(result.stop_reason, mixed ? "tool_use" : "end_turn");
         assert.equal(value.usage.cache_read_input_tokens, 50);
       }
       mixed = false;
@@ -102,7 +120,7 @@ for (const platform of ["mac", "windows"]) for (const model of ["gpt-5.4", "clau
       accepted = true;
     }
     assert.equal(enqueued.length, requests);
-    assert.equal(requests, 6);
+    assert.equal(requests, 10);
   });
 }
 
@@ -459,7 +477,7 @@ for (const platform of ["mac", "windows"]) {
     };
     const call = { type: "tool_use", id: "toolu_memory", name: "ProjectMemoryUpdate", input: { root: "/repo", changed_paths: ["a.js"] } };
     const result = { type: "tool_result", tool_use_id: "toolu_memory", content: "No such tool available: ProjectMemoryUpdate", is_error: true };
-    const payload = (stream, reply = [result]) => ({ model: "claude-sonnet-5.5", stream, tools: [{ name: "Edit", input_schema: { type: "object" } }],
+    const payload = (stream, reply = [result]) => ({ model: "claude-sonnet-5.5", stream, safeguards, tools: [{ name: "Edit", input_schema: { type: "object" } }],
       messages: [{ role: "user", content: "edit" }, { role: "assistant", content: [{ type: "text", text: "Done. 完成" }, call] }, { role: "user", content: reply }] });
 
     const streamed = await send(payload(true));
@@ -468,9 +486,11 @@ for (const platform of ["mac", "windows"]) {
     assert.deepEqual(events.map((event) => event.type), ["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]);
     assert.equal(events[2].delta.text, "Done. 完成");
     assert.equal(events[4].delta.stop_reason, "end_turn");
+    assert.deepEqual(events[4].delta.safeguard_results, emptyReview);
     assert.equal(events[4].usage.input_tokens, Math.ceil(Buffer.byteLength(JSON.stringify(payload(true))) / 4));
     const collected = JSON.parse((await send(payload(false))).body);
     assert.deepEqual([collected.content[0].text, collected.stop_reason, collected.role], ["Done. 完成", "end_turn", "assistant"]);
+    assert.deepEqual(collected.safeguard_results, emptyReview);
     assert.equal(JSON.stringify(enqueued), JSON.stringify([{ root: "/repo", changed_paths: ["a.js"] }]));
     assert.equal(forwarded.length, 0);
     for (const [model, expected] of [["gpt-6.1-sol", "anthropic/gpt-6.1-sol"],
@@ -565,7 +585,7 @@ for (const platform of ["mac", "windows"]) {
       request.emit("end");
       return { body: await done, response };
     };
-    const payload = (model, stream, tool = {}) => ({ model, stream, max_tokens: 1024, system: [{ type: "text", text: "Search once." }],
+    const payload = (model, stream, tool = {}) => ({ model, stream, safeguards, max_tokens: 1024, system: [{ type: "text", text: "Search once." }],
       messages: [{ role: "user", content: "Perform a web search for the query: q" }],
       tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 8, ...tool }], tool_choice: { type: "auto" }, thinking: { type: "disabled" } });
 
@@ -577,6 +597,7 @@ for (const platform of ["mac", "windows"]) {
     assert.equal(events[0].message.model, "anthropic/claude-opus-5.5");
     assert.deepEqual(events[4].content_block, content[1]);
     assert.equal(events[9].delta.stop_reason, "end_turn");
+    assert.deepEqual(events[9].delta.safeguard_results, emptyReview);
     assert.equal(searches[0].copilot, true);
     assert.equal(searches[0].body.tools[0].type, "web_search_20250305");
     assert.equal(searches[0].body.system[0].text, "Search once.");
@@ -587,6 +608,7 @@ for (const platform of ["mac", "windows"]) {
     const collected = JSON.parse((await send(payload("anthropic/gpt-6.1-sol[1m]", false))).body);
     assert.deepEqual(collected.content, content);
     assert.equal(collected.stop_reason, "end_turn");
+    assert.deepEqual(collected.safeguard_results, emptyReview);
     assert.equal(collected.model, "anthropic/openai/gpt-6.1-sol");
     assert.deepEqual([searches[1].copilot, searches[1].body.model], [false, "gpt-6.1-sol"]);
 
