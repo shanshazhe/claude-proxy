@@ -29,7 +29,7 @@ function readSource(file, old) {
   return baselineSources.get(file);
 }
 
-async function parityGateway(t, { old, route, routes = [route], auth, loadAuth = async () => auth, fetchImpl, onLog = () => {} }) {
+async function parityGateway(t, { old, route, routes = [route], auth, loadAuth = async () => auth, fetchImpl, onLog = () => {}, piOptions = {} }) {
   let server;
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-parity-"));
   t.after(() => fs.rmSync(fixtureRoot, { recursive: true, force: true }));
@@ -68,7 +68,9 @@ async function parityGateway(t, { old, route, routes = [route], auth, loadAuth =
       const dependency = path.posix.extname(resolved) ? resolved : `${resolved}.js`;
       if (!old && dependency === "lib/pi-model.js") {
         const { requestPiModel } = productionRequire(name);
-        return { requestPiModel: (body, options) => requestPiModel(body, { ...options, loadAuth: () => loadAuth(body.model), fetchImpl }) };
+        return { requestPiModel: (body, options) => requestPiModel(body, {
+          ...options, pace: async () => {}, ...piOptions, loadAuth: () => loadAuth(body.model), fetchImpl
+        }) };
       }
       const actual = load(dependency);
       if (old && file === entry && dependency === "lib/openai-responses.js") {
@@ -94,8 +96,9 @@ async function parityGateway(t, { old, route, routes = [route], auth, loadAuth =
   assert.ok(server);
   await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   t.after(async () => { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); });
-  return async (body, expectedStatus = 200) => {
-    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/messages`, {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const send = async (body, expectedStatus = 200) => {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(5000)
     });
     const text = await response.text();
@@ -103,6 +106,7 @@ async function parityGateway(t, { old, route, routes = [route], auth, loadAuth =
     assert.match(response.headers.get("content-type"), body.stream ? /^text\/event-stream/ : /^application\/json/);
     return body.stream ? assembleSse(text) : JSON.parse(text);
   };
+  return Object.assign(send, { baseUrl });
 }
 
 function assembleSse(text) {

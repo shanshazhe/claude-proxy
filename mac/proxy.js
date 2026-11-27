@@ -6,6 +6,7 @@ const fs = require("fs");
 const path = require("path");
 
 const { requestPiModel } = require("../lib/pi-model");
+const { withClientSafeguardResults } = require("../lib/mock-safeguards");
 const { selectModel, catalogModelId, toGatewayModels } = require("../lib/model-routing");
 const { createModelDiscovery } = require("../lib/model-discovery");
 const { parseWebSearchRequest, runWebSearch, toAnthropicMessage, toAnthropicEvents } = require("../lib/web-search");
@@ -271,6 +272,36 @@ async function writeSseEvent(res, eventName, data) {
   return writeWithBackpressure(res, `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
+function createMessageOutput(res, body, requestId) {
+  const clientToolIds = new Set();
+  const recordTool = (block) => {
+    if (block.type === "tool_use") clientToolIds.add(block.id);
+  };
+  const finalize = (message) => withClientSafeguardResults(body, message, clientToolIds,
+    (event, details) => logEvent(requestId, event, details));
+  return {
+    sendJson(message, headers) {
+      for (const block of message.content) recordTool(block);
+      const outbound = finalize(message);
+      res.writeHead(200, { ...headers, "Content-Type": "application/json" });
+      res.end(JSON.stringify(outbound));
+    },
+    writeEvent(event) {
+      if (event.type === "content_block_start") recordTool(event.content_block);
+      const outbound = event.type === "message_delta"
+        ? { ...event, delta: finalize(event.delta) } : event;
+      return writeSseEvent(res, outbound.type, outbound);
+    }
+  };
+}
+
+async function sendCompletedMessage(res, body, message, requestId) {
+  const output = createMessageOutput(res, body, requestId);
+  if (!body.stream) return output.sendJson(message);
+  for (const [, event] of toAnthropicEvents(message)) await output.writeEvent(event);
+  await endWithBackpressure(res);
+}
+
 // 项目记忆调用的后续请求由代理直接结束这一轮；用量按请求体字节估算，避免客户端的上下文统计归零。
 async function sendLocalMessage(res, body, text, requestBytes, requestId) {
   const native = selectModel(body.model, getConfiguredModel(body.model))?.replace(/\[1m\]$/i, "");
@@ -279,19 +310,9 @@ async function sendLocalMessage(res, body, text, requestBytes, requestId) {
     input_tokens: Math.ceil(requestBytes / ESTIMATED_BYTES_PER_TOKEN),
     output_tokens: Math.ceil(Buffer.byteLength(text) / ESTIMATED_BYTES_PER_TOKEN)
   };
-  if (!body.stream) {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ id: "msg_" + Date.now(), type: "message", role: "assistant", model,
-      content: [{ type: "text", text }], stop_reason: "end_turn", stop_sequence: null, usage }));
-    return;
-  }
-  if (!(await openAnthropicStream(res, model, requestId))) return;
-  await writeSseEvent(res, "content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-  await writeSseEvent(res, "content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
-  await writeSseEvent(res, "content_block_stop", { type: "content_block_stop", index: 0 });
-  await writeSseEvent(res, "message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage });
-  await writeSseEvent(res, "message_stop", { type: "message_stop" });
-  await endWithBackpressure(res);
+  if (body.stream && !(await openAnthropicStream(res, model, requestId))) return;
+  await sendCompletedMessage(res, body, { id: "msg_" + Date.now(), type: "message", role: "assistant", model,
+    content: [{ type: "text", text }], stop_reason: "end_turn", stop_sequence: null, usage }, requestId);
 }
 
 function startSseKeepAlive(res, requestId) {
@@ -329,6 +350,8 @@ async function openAnthropicStream(clientRes, model, requestId, initialMessage =
   if (typeof clientRes.flushHeaders === "function") {
     clientRes.flushHeaders();
   }
+  // Send verdicts with the final delta, after every client tool ID is known.
+  const { safeguard_results, ...initial } = initialMessage;
   await writeSseEvent(clientRes, "message_start", {
     type: "message_start",
     message: {
@@ -339,7 +362,7 @@ async function openAnthropicStream(clientRes, model, requestId, initialMessage =
       stop_reason: null,
       stop_sequence: null,
       usage: { input_tokens: 0, output_tokens: 0 },
-      ...initialMessage,
+      ...initial,
       model
     }
   });
@@ -350,10 +373,11 @@ async function openAnthropicStream(clientRes, model, requestId, initialMessage =
 
 // Both providers use Pi content events; only native Claude identity permits
 // signed/redacted thinking and the narrow opaque-block/citation extensions.
-function createAnthropicStreamHandler(clientRes, responseHandler = null) {
-  const writeEvent = async (name, data) => {
-    if (!responseHandler) return writeSseEvent(clientRes, name, data);
-    for (const event of responseHandler.event(data)) await writeSseEvent(clientRes, event.type, event);
+function createAnthropicStreamHandler(clientRes, responseHandler = null, body = {}, requestId) {
+  const output = createMessageOutput(clientRes, body, requestId);
+  const writeEvent = async (event) => {
+    if (!responseHandler) return output.writeEvent(event);
+    for (const outbound of responseHandler.event(event)) await output.writeEvent(outbound);
   };
   let index = 0;
   let blockKind = null;
@@ -366,17 +390,17 @@ function createAnthropicStreamHandler(clientRes, responseHandler = null) {
     if (blockKind === null) return;
     if (blockKind === "thinking" && !thinkingIsNative) {
       // Empty marks synthetic GPT thinking without exposing provider signatures.
-      await writeEvent("content_block_delta", { type: "content_block_delta", index,
+      await writeEvent({ type: "content_block_delta", index,
         delta: { type: "signature_delta", signature: "" } });
     }
-    await writeEvent("content_block_stop", { type: "content_block_stop", index });
+    await writeEvent({ type: "content_block_stop", index });
     blockKind = null;
     contentIndex = null;
     index++;
   };
   const openBlock = async (kind, piIndex, block, native = false) => {
     await stopBlock();
-    await writeEvent("content_block_start", { type: "content_block_start", index, content_block: block });
+    await writeEvent({ type: "content_block_start", index, content_block: block });
     blockKind = kind;
     contentIndex = piIndex;
     thinkingIsNative = native;
@@ -391,7 +415,7 @@ function createAnthropicStreamHandler(clientRes, responseHandler = null) {
     } else if (event.type === "native_block_delta") {
       const wireIndex = blockIndices.get(event.contentIndex);
       if (wireIndex === undefined) throw new Error("Native delta has no corresponding content block");
-      await writeEvent("content_block_delta", { type: "content_block_delta", index: wireIndex, delta: event.delta });
+      await writeEvent({ type: "content_block_delta", index: wireIndex, delta: event.delta });
     } else if (event.type === "native_block_stop") {
       if (contentIndex === event.contentIndex) await stopBlock();
     } else if (kind === "thinking" && block?.redacted) {
@@ -410,12 +434,12 @@ function createAnthropicStreamHandler(clientRes, responseHandler = null) {
         await openBlock(kind, event.contentIndex, kind === "thinking"
           ? { type: "thinking", thinking: "" } : { type: "text", text: "" }, native);
       }
-      await writeEvent("content_block_delta", { type: "content_block_delta", index,
+      await writeEvent({ type: "content_block_delta", index,
         delta: kind === "thinking" ? { type: "thinking_delta", thinking: event.delta } : { type: "text_delta", text: event.delta } });
     } else if (["text_end", "thinking_end"].includes(event.type)) {
       if (event.type === "thinking_end" && native && block?.thinkingSignature !== undefined) {
         if (contentIndex !== event.contentIndex) await openBlock("thinking", event.contentIndex, { type: "thinking", thinking: "" }, true);
-        await writeEvent("content_block_delta", { type: "content_block_delta", index,
+        await writeEvent({ type: "content_block_delta", index,
           delta: { type: "signature_delta", signature: block.thinkingSignature } });
       }
       if (contentIndex === event.contentIndex) await stopBlock();
@@ -425,7 +449,7 @@ function createAnthropicStreamHandler(clientRes, responseHandler = null) {
       const call = event.toolCall;
       await openBlock("tool_use", event.contentIndex,
         { type: "tool_use", id: native ? call.id : call.id.split("|")[0], name: call.name, input: {} });
-      await writeEvent("content_block_delta", { type: "content_block_delta", index,
+      await writeEvent({ type: "content_block_delta", index,
         delta: { type: "input_json_delta", partial_json: JSON.stringify(call.arguments) } });
       await stopBlock();
     }
@@ -437,14 +461,15 @@ function createAnthropicStreamHandler(clientRes, responseHandler = null) {
     if (carrier?.type === "thinking" && isReplayCarrier(carrier.signature)) {
       // Native mode: carry this exact signature instead of the synthetic empty one.
       await openBlock("thinking", null, { type: "thinking", thinking: "" }, true);
-      await writeEvent("content_block_delta", { type: "content_block_delta", index,
+      await writeEvent({ type: "content_block_delta", index,
         delta: { type: "signature_delta", signature: carrier.signature } });
     }
     await stopBlock();
     const delta = { stop_reason: message.stop_reason, stop_sequence: message.stop_sequence ?? null };
     if (message.stop_details !== undefined) delta.stop_details = message.stop_details;
-    await writeEvent("message_delta", { type: "message_delta", delta, usage: message.usage });
-    await writeEvent("message_stop", { type: "message_stop" });
+    if (message.safeguard_results !== undefined) delta.safeguard_results = message.safeguard_results;
+    await writeEvent({ type: "message_delta", delta, usage: message.usage });
+    await writeEvent({ type: "message_stop" });
     await endWithBackpressure(clientRes);
   };
   return { applyPiEvent, finish };
@@ -452,7 +477,7 @@ function createAnthropicStreamHandler(clientRes, responseHandler = null) {
 
 function requestPiStream(anthropicBody, model, requestId, clientRes, upstreamControl, responseHandler = null, requestOptions = {}) {
   logEvent(requestId, "Pi stream started", { model });
-  const handler = createAnthropicStreamHandler(clientRes, responseHandler);
+  const handler = createAnthropicStreamHandler(clientRes, responseHandler, anthropicBody, requestId);
   return requestPiModel(anthropicBody, {
     ...requestOptions, onEvent: handler.applyPiEvent, control: upstreamControl,
     onCacheUsage: (usage) => logEvent(requestId, "Prompt cache usage", usage)
@@ -559,14 +584,7 @@ async function answerWebSearch(anthropicBody, search, model, requestId, res, cap
       onReplayFailure: (counts) => logEvent(requestId, "Codex replay failure", counts) });
     stopKeepAlive();
     logEvent(requestId, "Web search completed", { model: result.model, auth_kind: result.authKind, searches: result.searches, results: result.hits, capped: result.capped });
-    const message = toAnthropicMessage(result, model);
-    if (!anthropicBody.stream) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(message));
-      return;
-    }
-    for (const [name, data] of toAnthropicEvents(message)) await writeSseEvent(res, name, data);
-    await endWithBackpressure(res);
+    await sendCompletedMessage(res, anthropicBody, toAnthropicMessage(result, model), requestId);
   } catch (error) {
     stopKeepAlive();
     if (res.destroyed || res.writableEnded) return;
@@ -728,9 +746,9 @@ const server = http.createServer(async (req, res) => {
               onCacheUsage: (usage) => logEvent(requestId, "Prompt cache usage", usage)
             });
             if (res.destroyed || res.writableEnded) return;
-            res.writeHead(200, { ...responseHeaders, "Content-Type": "application/json" });
             const response = { ...anthropicResp, model: clientModel };
-            res.end(JSON.stringify(responseHandler ? responseHandler.message(response) : response));
+            const outbound = responseHandler ? responseHandler.message(response) : response;
+            createMessageOutput(res, anthropicBody, requestId).sendJson(outbound, responseHeaders);
           } finally {
             res.off("close", onClose);
           }
